@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.pytest_cache/
+
+# 采集数据不进版本库。
+# 数据默认已移到 $XDG_DATA_HOME/mac-thermal-lab/recordings，
+# 这两条只是防止有人在仓库里手动放了数据或旧目录残留。
+# 注意：tests/fixtures/*.jsonl 是测试固件，必须保留。
+recordings/
+data/
+
+# macOS
+.DS_Store

@@ -1,0 +1,29 @@
+[project]
+name = "mac-thermal-lab"
+version = "0.1.0"
+description = "macOS Apple Silicon 本地热状态与功耗实验记录工具"
+readme = "README.md"
+authors = [{ name = "Jeasin" }]
+requires-python = ">=3.13"
+keywords = ["macos", "apple-silicon", "thermal", "powermetrics", "macmon", "benchmark"]
+dependencies = ["plotly>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/Jeasin/MacThermalLab"
+Repository = "https://github.com/Jeasin/MacThermalLab"
+Issues = "https://github.com/Jeasin/MacThermalLab/issues"
+
+[project.scripts]
+mtl = "mac_thermal_lab.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
