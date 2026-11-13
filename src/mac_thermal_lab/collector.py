@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import fps as fps_mod
 from . import macmon as macmon_mod
 from .powermetrics import ThermalParser, build_command as build_powermetrics_command
 from .storage import (
@@ -51,6 +52,19 @@ def _short_thermal_reason(tail: list[str], returncode: int | None) -> str:
         return "未找到 powermetrics 命令"
     text = tail[-1][:120] if tail else f"退出码 {returncode}"
     return f"powermetrics 退出：{text}"
+
+
+def _short_hud_reason(tail: list[str]) -> str:
+    """把 log stream 的报错压成一句人话。"""
+    blob = " ".join(tail).lower()
+    if "sandbox" in blob:
+        return "log 命令被沙箱限制，无法读取系统日志"
+    if "not permitted" in blob or "operation not permitted" in blob:
+        return "没有读取系统日志的权限"
+    if "predicate" in blob:
+        return "log stream 的过滤条件被拒绝"
+    text = tail[-1][:120] if tail else "未知错误"
+    return f"log stream 退出：{text}"
 
 
 class LineWriter:
@@ -112,29 +126,44 @@ class Collector:
         thermal_enabled: bool = True,
         password_fd: int | None = None,
         soc_info_flag: bool = True,
+        game_filter: str | None = None,
     ) -> None:
         self.paths = paths
         self.interval_ms = interval_ms
         self.thermal_enabled = thermal_enabled
         self.password_fd = password_fd
         self.soc_info_flag = soc_info_flag
+        # None 表示不采帧率；空串表示自动识别是哪个进程的 HUD
+        self.game_enabled = game_filter is not None
+        self.game_filter = (game_filter or "").strip() or None
 
         self.stop_event = threading.Event()
         # state / runtime 分属 XDG 的另外两个目录，先建好再开日志与锁
         paths.ensure_runtime_dirs()
         self.logger = Logger(paths.daemon_log)
         self._lock = threading.Lock()
-        self.counts = {"macmon_samples": 0, "macmon_bad_lines": 0, "thermal_samples": 0}
+        self.counts = {
+            "macmon_samples": 0,
+            "macmon_bad_lines": 0,
+            "thermal_samples": 0,
+            "fps_samples": 0,
+        }
         self.children: dict[str, dict[str, Any]] = {}
         self.errors: list[str] = []
         self.started_at = utc_now()
-        self.last_sample_at: dict[str, str | None] = {"macmon": None, "powermetrics": None}
+        self.last_sample_at: dict[str, str | None] = {
+            "macmon": None, "powermetrics": None, "hud": None,
+        }
         self.macmon_restarts = 0
         self.thermal_error: str | None = None
+        self.game_error: str | None = None
+        self._game_process: str | None = None
         self._soc_captured = False
         self._stop_reason = "unknown"
         self._current_macmon: subprocess.Popen | None = None
         self._current_thermal: subprocess.Popen | None = None
+        self._current_hud: subprocess.Popen | None = None
+        self._hud_parser = fps_mod.HudStreamParser(self.game_filter)
         self._lock_file = None
 
     # ------------------------------------------------------------------ #
@@ -159,6 +188,8 @@ class Collector:
             self._record_error("macmon 启动失败，本次实验没有硬件指标")
         thermal_proc = self._spawn_powermetrics() if self.thermal_enabled else None
         self._current_thermal = thermal_proc
+        hud_proc = self._spawn_hud() if self.game_enabled else None
+        self._current_hud = hud_proc
 
         readers: list[threading.Thread] = []
         if macmon_proc is not None:
@@ -176,6 +207,14 @@ class Collector:
             )
             readers.append(self._start_stderr_reader("powermetrics.err", thermal_proc))
 
+        hud_writer = None
+        fps_sidecar = None
+        if hud_proc is not None:
+            hud_writer = LineWriter(self.paths.hud_raw, self.logger)
+            fps_sidecar = self.paths.fps_samples.open("a", encoding="utf-8", buffering=1)
+            readers.append(self._start_hud_reader(hud_proc, hud_writer, fps_sidecar))
+            readers.append(self._start_hud_stderr_reader(hud_proc))
+
         try:
             while not self.stop_event.wait(1.0):
                 self._supervise()
@@ -183,7 +222,7 @@ class Collector:
         except KeyboardInterrupt:
             self._stop_reason = "interrupted"
         finally:
-            self._shutdown(thermal_writer, thermal_sidecar, readers)
+            self._shutdown(thermal_writer, thermal_sidecar, readers, hud_writer, fps_sidecar)
 
         return 0
 
@@ -248,6 +287,118 @@ class Collector:
             write_json(self.paths.metadata, meta)
         except OSError:
             pass
+
+    # ------------------------------------------------------------------ #
+    # 帧率（Metal HUD）
+    # ------------------------------------------------------------------ #
+    def _spawn_hud(self) -> subprocess.Popen | None:
+        if not os.path.exists(fps_mod.LOG_BIN):
+            self._record_error("未找到 /usr/bin/log，无法读取 Metal HUD 的帧率日志")
+            self._mark_game_error("系统缺少 log 命令")
+            return None
+        cmd = fps_mod.build_log_stream_command(self.game_filter)
+        self.logger.log(f"启动 HUD 帧率采集：{' '.join(cmd)}")
+        proc = self._popen(cmd, name="hud")
+        if proc is None:
+            self._mark_game_error("log stream 无法启动")
+        return proc
+
+    def _mark_game_error(self, message: str) -> None:
+        if self.game_error is not None:
+            return
+        self.game_error = message
+        meta = read_json(self.paths.metadata) or {}
+        game = meta.get("game")
+        if not isinstance(game, dict):
+            game = {}
+            meta["game"] = game
+        game["error"] = message
+        try:
+            write_json(self.paths.metadata, meta)
+        except OSError:
+            pass
+
+    def _capture_game_process(self, process: str | None) -> None:
+        """记下第一个出现 HUD 的进程名，报告里用来标注是哪款游戏。"""
+        if not process or process == self._game_process:
+            return
+        self._game_process = process
+        meta = read_json(self.paths.metadata) or {}
+        game = meta.get("game")
+        if not isinstance(game, dict):
+            game = {}
+            meta["game"] = game
+        if not game.get("process"):
+            game["process"] = process
+            try:
+                write_json(self.paths.metadata, meta)
+            except OSError:
+                pass
+
+    def _start_hud_reader(
+        self, proc: subprocess.Popen, writer: LineWriter, sidecar
+    ) -> threading.Thread:
+        thread = threading.Thread(
+            target=self._read_hud,
+            args=(proc, writer, sidecar),
+            name="hud-reader",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _read_hud(self, proc: subprocess.Popen, writer: LineWriter, sidecar) -> None:
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                if not line.strip():
+                    continue
+                writer.write(line)          # 原始 ndjson 一律保留
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                sample = self._hud_parser.feed(record)
+                if sample is None:
+                    continue
+                try:
+                    append_jsonl(sidecar, sample)
+                except OSError as exc:
+                    self._record_error(f"写入帧率解析缓存失败：{exc}")
+                with self._lock:
+                    self.counts["fps_samples"] += 1
+                    self.last_sample_at["hud"] = sample["timestamp"]
+                self._capture_game_process(sample.get("process"))
+        finally:
+            writer.close()
+            try:
+                sidecar.close()
+            except OSError:
+                pass
+
+    def _start_hud_stderr_reader(self, proc: subprocess.Popen) -> threading.Thread:
+        def run() -> None:
+            if proc.stderr is None:
+                return
+            writer = LineWriter(self.paths.hud_err, self.logger)
+            tail: list[str] = []
+            try:
+                for line in proc.stderr:
+                    writer.write(line)
+                    if line.strip():
+                        tail = (tail + [line.strip()])[-6:]
+            finally:
+                writer.close()
+                if proc.poll() not in (0, None) and tail:
+                    self._record_error("HUD 采集报错：" + " | ".join(tail[-3:]))
+                    self._mark_game_error(_short_hud_reason(tail))
+
+        thread = threading.Thread(target=run, name="hud-stderr", daemon=True)
+        thread.start()
+        return thread
 
     def _read_password(self) -> str:
         if self.password_fd is None:
@@ -425,6 +576,17 @@ class Collector:
                         f"powermetrics 中途退出（code={proc.returncode}）"
                     )
 
+        hud = self.children.get("hud")
+        if hud and hud.get("alive"):
+            proc = self._current_hud
+            if proc is not None and proc.poll() is not None:
+                with self._lock:
+                    hud["alive"] = False
+                self.logger.log(f"hud 采集退出 code={proc.returncode}")
+                self._record_error(
+                    f"log stream 已退出（code={proc.returncode}），帧率不再更新"
+                )
+
     def _capture_soc(self, soc: dict[str, Any]) -> None:
         self._soc_captured = True
         meta = read_json(self.paths.metadata) or {}
@@ -455,6 +617,8 @@ class Collector:
                 "heartbeat_at": iso_utc(utc_now()),
                 "interval_ms": self.interval_ms,
                 "thermal_enabled": self.thermal_enabled,
+                "game_enabled": self.game_enabled,
+                "game_process": self._game_process,
                 "counts": dict(self.counts),
                 "last_sample_at": dict(self.last_sample_at),
                 "children": {k: dict(v) for k, v in self.children.items()},
@@ -469,13 +633,17 @@ class Collector:
     # ------------------------------------------------------------------ #
     # 收尾
     # ------------------------------------------------------------------ #
-    def _shutdown(self, thermal_writer, thermal_sidecar, readers) -> None:
+    def _shutdown(
+        self, thermal_writer, thermal_sidecar, readers, hud_writer=None, fps_sidecar=None
+    ) -> None:
         self.logger.log(f"开始收尾（{self._stop_reason}）")
         procs: list[tuple[str, subprocess.Popen]] = []
         if self._current_macmon is not None:
             procs.append(("macmon", self._current_macmon))
         if self._current_thermal is not None:
             procs.append(("powermetrics", self._current_thermal))
+        if self._current_hud is not None:
+            procs.append(("hud", self._current_hud))
 
         for name, proc in procs:
             self._terminate(name, proc)
@@ -483,7 +651,7 @@ class Collector:
         for thread in readers:
             thread.join(timeout=3.0)
 
-        for closer in (thermal_writer, thermal_sidecar):
+        for closer in (thermal_writer, thermal_sidecar, hud_writer, fps_sidecar):
             if closer is not None:
                 try:
                     closer.close()
@@ -506,7 +674,8 @@ class Collector:
 
         self._write_state(status="stopped")
         self.logger.log(
-            f"收尾完成：macmon={self.counts['macmon_samples']} thermal={self.counts['thermal_samples']}"
+            f"收尾完成：macmon={self.counts['macmon_samples']} "
+            f"thermal={self.counts['thermal_samples']} fps={self.counts['fps_samples']}"
         )
         self._remove_pid_file()
         if self._lock_file is not None:
@@ -569,6 +738,7 @@ def run_collector(
     thermal_enabled: bool = True,
     password_fd: int | None = None,
     soc_info: bool = True,
+    game_filter: str | None = None,
 ) -> int:
     collector = Collector(
         SessionPaths(session_dir),
@@ -576,5 +746,6 @@ def run_collector(
         thermal_enabled=thermal_enabled,
         password_fd=password_fd,
         soc_info_flag=soc_info,
+        game_filter=game_filter,
     )
     return collector.run()

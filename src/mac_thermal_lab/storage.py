@@ -32,6 +32,9 @@ EVENTS = "events.jsonl"
 MERGED_CSV = "merged.csv"
 DASHBOARD = "dashboard.html"
 DAEMON_LOG = "collector.log"
+HUD_RAW = "hud.log"
+HUD_ERR = "hud.err.log"
+FPS_SAMPLES = "fps.jsonl"
 
 # 会话目录里属于「实验数据」的文件（会随迁移一起搬走）
 DATA_FILES = (
@@ -43,6 +46,9 @@ DATA_FILES = (
     MERGED_CSV,
     DASHBOARD,
     "powermetrics.samples.jsonl",
+    HUD_RAW,
+    HUD_ERR,
+    FPS_SAMPLES,
 )
 
 # 旧布局里混在会话目录中的运行期文件，迁移时挪去 state/runtime
@@ -236,6 +242,18 @@ class SessionPaths:
     @property
     def dashboard(self) -> Path:
         return self.root / DASHBOARD
+
+    @property
+    def hud_raw(self) -> Path:
+        return self.root / HUD_RAW
+
+    @property
+    def hud_err(self) -> Path:
+        return self.root / HUD_ERR
+
+    @property
+    def fps_samples(self) -> Path:
+        return self.root / FPS_SAMPLES
 
     @property
     def legacy_runtime_files(self) -> list[Path]:

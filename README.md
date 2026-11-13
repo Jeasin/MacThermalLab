@@ -55,6 +55,13 @@ mtl status                  # 看实时状态
 mtl stop                    # 结束，生成报告，返回路径
 ```
 
+要连帧率一起记，加 `--game`（详见[帧率](#帧率游戏-fps)）：
+
+```bash
+mtl start 王国之泪 --game          # 自动识别进程
+mtl start 王国之泪 --game Ryujinx  # 或指定进程名
+```
+
 `mtl stop` 之后直接用浏览器打开打印出来的 `dashboard.html`，或：
 
 ```bash
@@ -67,13 +74,13 @@ mtl report --open           # 重新生成最近一次实验的报告并打开
 
 | 命令 | 说明 |
 | --- | --- |
-| `mtl start [名称]` | 开始新实验。名称留空则用时间戳 |
-| `mtl stop [会话]` | 停止采集、整理数据、生成报告 |
+| `mtl start [名称] [--game [进程]]` | 开始新实验。名称留空则用时间戳 |
+| `mtl stop [会话] [--force]` | 停止采集、整理数据、生成报告 |
 | `mtl status [会话]` | 采集状态、时长、样本数、子进程、已落盘大小 |
 | `mtl mark "事件" -n 备注` | 在当前实验时间轴加事件 |
 | `mtl report [会话] [--open]` | 重新生成 HTML 报告 |
 | `mtl list` | 列出历史实验 |
-| `mtl doctor [--thermal]` | 环境自检；`--thermal` 实跑一次 powermetrics |
+| `mtl doctor [--thermal] [--game]` | 环境自检；`--thermal` 实跑 powermetrics，`--game` 实测帧率链路 |
 | `mtl paths [--init-config]` | 显示 XDG 目录布局；`--init-config` 写配置模板 |
 | `mtl migrate [--dry-run]` | 把旧目录里的实验迁到 XDG 数据目录 |
 
@@ -82,6 +89,7 @@ mtl report --open           # 重新生成最近一次实验的报告并打开
 ```bash
 mtl start 测试 -i 1000          # 采样间隔 1s（也接受 500ms / 2s，默认 2000ms）
 mtl start 测试 --no-thermal     # 不采集 Thermal Pressure，完全免 sudo
+mtl start 测试 --game           # 同时记录游戏帧率（Metal HUD）
 mtl --data-dir ~/thermal start  # 临时换数据目录（也可 export MTL_DATA_DIR）
 ```
 
@@ -89,6 +97,8 @@ mtl --data-dir ~/thermal start  # 临时换数据目录（也可 export MTL_DATA
 
 - 同一时间只允许一个活动实验，重复 `start` 会被拒绝。
 - `stop` 只终止自己启动的进程（按 PID + 进程组校验），不会 `pkill` 掉你其它的监控进程。
+- **`stop` 不会认错会话**：带了名字但指到别的（比如已经结束的）会话时，直接拒绝并告诉你当前在跑的是哪个；
+  只重出报告请用 `mtl report <会话>`。已经结束的会话要再收尾一次得显式加 `--force`。
 - 终端意外关闭或进程被杀，原始数据仍在；`mtl status` 会提示，`mtl stop` 可从已有数据补出报告。
 
 ---
@@ -123,8 +133,11 @@ mtl paths
 ├── powermetrics.log           原始输出，逐行未改动
 ├── powermetrics.err.log       powermetrics 的 stderr
 ├── powermetrics.samples.jsonl 采集时顺带解析的缓存（用于补缺失时间戳）
+├── hud.log                    log stream 的原始 ndjson（仅在 --game 时产生）
+├── hud.err.log                log stream 的 stderr
+├── fps.jsonl                  逐秒帧率样本（fps / 1% low / 帧间隔 / GPU 时间）
 ├── events.jsonl               人工事件
-├── merged.csv                 两路数据按时间戳对齐后的并集
+├── merged.csv                 三路数据按时间戳对齐后的并集
 └── dashboard.html             离线可交互报告
 ```
 
@@ -195,9 +208,53 @@ mtl migrate             # 执行
 | `thermal_pressure` | as-of 取值：不晚于该行的最近一次真实 Thermal 样本 |
 | `thermal_pressure_raw` | **仅**在 powermetrics 真实样本行上出现原始状态文本 |
 | `thermal_pressure_age_s` | as-of 数据年龄，超龄时留空（默认阈值为 4 倍采样间隔或 10s） |
+| `fps` | as-of 取向最近一条 Metal HUD 帧率；`source=metal-hud` 的行是本行自己的值 |
+| `fps_1pct` | 该秒内最差 1% 帧间隔换算出的帧率 |
+| `fps_age_s` | 帧率的 as-of 年龄（HUD 每秒一条，阈值默认为 2 倍采样间隔或 4s） |
+| `game_process` | 该帧率来自哪个进程（HUD 日志里的进程名） |
 
 `thermal_pressure` 是「取最近一次已知状态」，不是插值，也不会凭空造样本；
 判断可信度请一并看 `thermal_pressure_age_s`。
+
+---
+
+## 帧率（游戏 FPS）
+
+加 `--game` 后，`mtl` 会打开 macOS 自带的 **Metal Performance HUD 日志**，
+再把系统日志里的逐秒帧率抓下来，和温度/功耗放到同一根时间轴上。
+
+```bash
+mtl start 王国之泪 --game          # 自动识别是哪个进程
+mtl start 王国之泪 --game Ryujinx  # 指定进程名（子串匹配）
+```
+
+原理：Apple 的 HUD 在 `MTL_HUD_ENABLED=1` 时显示浮层，再加上
+`MTL_HUD_LOG_ENABLED=1` 后，每秒往统一日志写一行
+`metal-HUD: 首帧号,丢帧,内存MB,帧间隔ms,GPU时间ms,...`。
+`mtl` 用 `log stream` 读这一行并解析成 `fps.jsonl`——不需要录屏权限，也不做 OCR。
+
+### 三条必须遵守的使用条件
+
+1. **游戏必须在设置环境变量之后启动**。`mtl start --game` 用 `launchctl setenv`
+   设用户域变量，只对之后新启动的 GUI 应用生效。先开游戏再 `start` 是抓不到的。
+2. **只对 Metal 呈现的应用有效**。原生 Metal 游戏、MoltenVK / CrossOver / 模拟器
+   这类最终走 `CAMetalLayer` 的程序一般都有；纯 OpenGL 或某些包装层没有。
+3. **`mtl stop` 会还原环境变量**，把 HUD 关掉。如果异常退出导致没还原，
+   `launchctl unsetenv MTL_HUD_ENABLED` 手动关。留着的话 HUD 会出现在所有 GUI 应用上。
+
+### 抓不到数据时
+
+```bash
+mtl doctor --game      # 实测一次：开关环境变量 → log stream 3s → 解析，然后还原
+```
+
+- 输出「没有捕获到 metal-HUD 日志行」且此刻没有游戏在跑，是正常结果。
+- 报告里帧率面板会直接写明原因（没开 `--game` / 环境变量设不上 / 没抓到 HUD 行）。
+- 原始 `log stream` 输出都在 `hud.log`，可以自己翻。
+
+> **未实测提醒**：这条链路的解析逻辑用合成样本覆盖了（含格式容错、帧号差分兜底），
+> 但开发环境的沙箱禁止执行 `log` 与 `launchctl setenv`，所以**没有在真实游戏上跑通过**。
+> 第一次用请先跑 `mtl doctor --game` 确认。
 
 ---
 
@@ -205,12 +262,13 @@ mtl migrate             # 执行
 
 `dashboard.html` 是完整的自包含页面（plotly.js 内嵌，约 5MB），断网可用。
 
-- **KPI 卡**：时长、CPU/GPU 温度、CPU/GPU 功耗、All Power、主导 Thermal 状态、采样点。
+- **KPI 卡**：时长、CPU/GPU 温度、CPU/GPU 功耗、All Power、主导 Thermal 状态、采样点（加了 `--game` 还有平均帧率）。
 - **面板 1 温度**：CPU / GPU 平均温度（°C）。
 - **面板 2 功耗**：CPU / GPU / All Power（实线），Sys Power（点线，单独标注口径）。
 - **面板 3 Thermal Pressure**：状态色带 + 阶梯线，Nominal / Moderate / Heavy / Trapping / Unknown。
 - **面板 4 频率与负载**：E/S/GPU 频率（左轴 MHz）+ CPU/GPU 使用率（右轴 %）。
-- **事件**：贯穿四个面板的虚线，顶部带标签，悬停显示备注。
+- **面板 5 帧率**：每秒帧率（实线）+ 1% low（点线），悬停显示帧间隔与 GPU 时间。
+- **事件**：贯穿所有面板的虚线，顶部带标签，悬停显示备注。
 - 时间轴统一，支持框选缩放、拖动平移、`x unified` 悬停；缺失处曲线断开，不插值。
 
 ---
@@ -248,7 +306,7 @@ mtl migrate             # 执行
 
 ```bash
 uv sync                       # 建环境
-uv run pytest                 # 61 个用例
+uv run pytest                 # 76 个用例
 uv run mtl --help
 uv run mtl start 调试 -i 1000 # 跑源码，不必先 tool install
 ```
@@ -266,6 +324,7 @@ src/mac_thermal_lab/
 ├── paths.py         XDG 目录解析与 config.toml
 ├── migrate.py       旧目录迁移（复制—校验—落位—清理）
 ├── storage.py       会话路径、时间戳、flock 存活判定
+├── fps.py           Metal HUD 帧率解析（log stream）
 ├── analysis.py      时间戳对齐、统计
 ├── events.py        事件标记
 └── report.py        Plotly 报告

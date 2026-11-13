@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import fps as fps_mod
 from .analysis import load_session, summary as build_summary
 from .collector import run_collector
 from .events import append_event
@@ -274,6 +275,18 @@ def cmd_start(args) -> int:
     # 认证通过后再建目录：中途取消不会留下空会话
     session = create_session_dir(paths.recordings_dir, args.name)
 
+    # 帧率：打开 Metal HUD 的日志开关。必须在游戏启动之前设置——
+    # launchctl 设的是用户域环境变量，只对之后新启动的 GUI 应用生效。
+    game_filter = getattr(args, "game", None)
+    game_enabled = game_filter is not None
+    game_snapshot: dict[str, str | None] | None = None
+    game_applied: list[str] = []
+    game_error: str | None = None
+    if game_enabled:
+        game_snapshot, game_applied, failed = fps_mod.enable_hud_env()
+        if failed:
+            game_error = "无法设置 " + "/".join(failed) + "（需要图形登录会话）"
+
     started_at = utc_now()
     metadata: dict[str, Any] = {
         "schema": 1,
@@ -291,6 +304,14 @@ def cmd_start(args) -> int:
             "powermetrics": shutil.which("powermetrics"),
         },
         "thermal": {"enabled": thermal_enabled, "sudo_mode": sudo_mode, "error": None},
+        "game": {
+            "enabled": game_enabled,
+            "filter": game_filter or None,
+            "env_snapshot": game_snapshot,
+            "env_applied": game_applied,
+            "error": game_error,
+            "process": None,
+        },
         "counts": {},
         "errors": [],
     }
@@ -314,6 +335,8 @@ def cmd_start(args) -> int:
         cmd += ["--password-fd", str(read_fd)]
     if args.no_soc_info:
         cmd.append("--no-soc-info")
+    if game_enabled:
+        cmd += ["--game-filter", game_filter or ""]
 
     pass_fds = (read_fd,) if read_fd is not None else ()
     session.ensure_runtime_dirs()
@@ -367,6 +390,17 @@ def cmd_start(args) -> int:
                   f"{c('mtl status', C_BOLD)} 复查")
     else:
         print("  Thermal   未启用（--no-thermal）")
+
+    if game_enabled:
+        if game_error:
+            print(warn(f"帧率采集可能不可用：{game_error}"))
+            print(f"  {c('macmon 与 Thermal 不受影响', C_DIM)}")
+        else:
+            label = game_filter or "自动识别"
+            print(f"  帧率      Metal HUD 已开启（{label}）")
+            print(f"            {c('现在启动游戏即可；HUD 每秒写一行到系统日志', C_DIM)}")
+    else:
+        print(c("  帧率      未采集（加 --game 可记录）", C_DIM))
     print()
     print(f"  {c('mtl mark \"游戏开始\"', C_BOLD)}   在时间轴打一个事件标记")
     print(f"  {c('mtl status', C_BOLD)}             查看采集状态")
@@ -393,15 +427,44 @@ def _thermal_startup_state(session: SessionPaths, timeout: float = 3.0) -> tuple
 def cmd_stop(args) -> int:
     paths = _app_paths(args)
     roots = _records_roots(paths)
+    force = bool(getattr(args, "force", False))
+    active = _active_session(roots)
     session: SessionPaths | None = None
+
     if args.session:
         try:
-            session = resolve_session_multi(roots, args.session)
+            target = resolve_session_multi(roots, args.session)
         except LookupError as exc:
             print(err(str(exc)))
             return 1
+        target_meta = read_json(target.metadata) or {}
+        target_alive = _session_status(target)["alive"]
+
+        # 名字解析是模糊的（目录名 / 前缀 / 显示名都算），所以 stop 必须显式确认
+        # 目标就是正在跑的那个，否则很容易「以为结束了当前实验，其实动的是旧会话」。
+        if active is not None and target.root != active.root:
+            print(err(f"「{args.session}」不是当前正在进行的实验，未做任何改动"))
+            print(f"  当前实验  {active.name}"
+                  f"（{fmt_local(parse_timestamp((read_json(active.metadata) or {}).get('started_at')))} 开始）")
+            ended = parse_timestamp(target_meta.get("ended_at"))
+            print(f"  你指的是  {target.name}"
+                  + (f"（已于 {fmt_local(ended)} 结束）" if ended else ""))
+            print()
+            print(f"  结束当前实验：{c('mtl stop', C_BOLD)}")
+            print(f"  只想重出报告：{c(f'mtl report {args.session}', C_BOLD)}")
+            return 1
+
+        if not target_alive and target_meta.get("ended_at") and not force:
+            ended = parse_timestamp(target_meta.get("ended_at"))
+            print(err(f"实验「{target.name}」已经结束过了"))
+            print(f"  结束于    {fmt_local(ended)}")
+            print()
+            print(f"  重新生成报告：{c(f'mtl report {args.session}', C_BOLD)}")
+            print(f"  确实要再收尾一次：{c(f'mtl stop {args.session} --force', C_BOLD)}")
+            return 1
+        session = target
     else:
-        session = _active_session(roots)
+        session = active
         if session is None:
             # 采集进程已消失（崩溃 / 终端被关）：找最近一个没有 ended_at 的会话继续收尾
             unfinished = [
@@ -411,7 +474,12 @@ def cmd_stop(args) -> int:
             ]
             if unfinished:
                 session = unfinished[-1]
-                print(warn(f"采集进程已不在，将从已落盘数据恢复：{session.name}"))
+                if len(unfinished) > 1:
+                    print(warn(f"有 {len(unfinished)} 个未收尾的实验，将处理最近的一个：{session.name}"))
+                    print(c("  其余可逐个指定：mtl stop " +
+                            " / mtl stop ".join(s.name for s in unfinished[:-1]), C_DIM))
+                else:
+                    print(warn(f"采集进程已不在，将从已落盘数据恢复：{session.name}"))
     if session is None:
         print(err("当前没有正在进行的实验"))
         return 1
@@ -421,7 +489,7 @@ def cmd_stop(args) -> int:
     pid = info["pid"]
 
     if info["alive"]:
-        print(f"停止采集进程 pid={pid} ...")
+        print(f"停止采集进程 pid={pid}（{session.name}） ...")
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError as exc:
@@ -438,6 +506,18 @@ def cmd_stop(args) -> int:
 
     # 清理可能残留的、确认属于本次实验的子进程
     _reap_orphans(session, state)
+
+    # 还原帧率采集改过的环境变量：不还原的话 HUD 会一直跟着所有 GUI 应用
+    game_meta = (read_json(session.metadata) or {}).get("game") or {}
+    if game_meta.get("enabled") and game_meta.get("env_applied"):
+        failed = fps_mod.restore_hud_env(
+            game_meta.get("env_snapshot"), game_meta.get("env_applied")
+        )
+        if failed:
+            print(warn("Metal HUD 环境变量还原失败：" + "/".join(failed)))
+            print(f"  手动关闭：{c('launchctl unsetenv MTL_HUD_ENABLED', C_BOLD)}")
+        else:
+            print(c("已关闭 Metal HUD（环境变量已还原）", C_DIM))
 
     meta = read_json(session.metadata) or {}
     if info["alive"]:
@@ -475,9 +555,11 @@ def cmd_stop(args) -> int:
     data = load_session(session)
     smy = build_summary(data)
     print(ok("实验已结束"))
+    print(f"  会话      {session.name}")
     print(f"  时长      {fmt_duration(smy.get('span_seconds'))}")
     print(f"  样本      macmon {smy['integrity']['macmon']['count']} · "
-          f"thermal {smy['integrity']['thermal']['count']}")
+          f"thermal {smy['integrity']['thermal']['count']} · "
+          f"fps {smy['raw_counts'].get('fps_samples', 0)}")
     print(f"  报告      {c(str(dashboard), C_BOLD)}")
     thermal_meta = (read_json(session.metadata) or {}).get("thermal") or {}
     if thermal_meta.get("enabled") and smy["integrity"]["thermal"]["count"] == 0:
@@ -486,6 +568,15 @@ def cmd_stop(args) -> int:
         if thermal_meta.get("error"):
             print(f"  原因：{thermal_meta['error']}")
         print(f"  排查：{c('mtl doctor --thermal', C_BOLD)}")
+    game_meta = (read_json(session.metadata) or {}).get("game") or {}
+    if game_meta.get("enabled") and smy["raw_counts"].get("fps_samples", 0) == 0:
+        print()
+        print(warn("本次启用了帧率采集，但没有捕获到 Metal HUD 数据"))
+        if game_meta.get("error"):
+            print(f"  原因：{game_meta['error']}")
+        else:
+            print("  常见原因：游戏在设置环境变量之前就启动了；或该游戏不走 Metal 呈现")
+        print(f"  排查：{c('mtl doctor --game', C_BOLD)}")
     if smy["warnings"]:
         print()
         for message in smy["warnings"]:
@@ -578,7 +669,8 @@ def cmd_status(args) -> int:
     counts = state.get("counts") or meta.get("counts") or {}
     if counts:
         print(f"  样本      macmon {counts.get('macmon_samples', 0)} · "
-              f"thermal {counts.get('thermal_samples', 0)}"
+              f"thermal {counts.get('thermal_samples', 0)} · "
+              f"fps {counts.get('fps_samples', 0)}"
               + (f" · 坏行 {counts['macmon_bad_lines']}" if counts.get("macmon_bad_lines") else ""))
 
     last = state.get("last_sample_at") or {}
@@ -600,6 +692,15 @@ def cmd_status(args) -> int:
         print(warn("本次实验未采集 Thermal Pressure"))
     elif thermal_meta.get("error"):
         print(warn(f"Thermal 采集异常：{thermal_meta['error']}"))
+
+    game_meta = meta.get("game") or {}
+    if game_meta.get("enabled"):
+        if game_meta.get("error"):
+            print(warn(f"帧率采集异常：{game_meta['error']}"))
+        elif game_meta.get("process"):
+            print(f"  HUD 进程  {game_meta['process']}")
+        elif counts.get("fps_samples", 0) == 0:
+            print(warn("帧率采集已开启，但还没有收到 Metal HUD 日志（游戏启动了吗？）"))
 
     errors = state.get("errors") or []
     if errors:
@@ -780,6 +881,33 @@ def cmd_doctor(args) -> int:
         for sample in result["samples"]:
             print(f"  {sample['ts']}  {sample['level']}  (来源: {sample['ts_source']})")
         print(ok(f"解析到 {len(result['samples'])} 条样本"))
+
+    if getattr(args, "game", False):
+        print()
+        print(heading("帧率（Metal HUD）实测"))
+        hud = fps_mod.hud_selftest(seconds=3.0)
+        before = hud["env_before"].get("MTL_HUD_ENABLED")
+        print(f"  环境变量   测试前{'已开启' if before else '未开启'}，测试后已还原")
+        if not hud["can_set"]:
+            print(err("launchctl 无法设置环境变量：" + "/".join(hud["failed_keys"])))
+            print(c("  需要在图形登录会话的终端里运行；沙箱或远程会话里会被拒绝", C_DIM))
+            return 1
+        print(ok("launchctl 环境变量可设置"))
+        print(f"  log stream 3s 内收到 {hud['raw_lines']} 行")
+        if hud["error"]:
+            print(err(hud["error"]))
+        if hud.get("sample_count"):
+            for sample in hud["samples"]:
+                ts = parse_timestamp(sample.get("timestamp"))
+                print(f"  {fmt_local(ts, '%H:%M:%S')}  {sample.get('fps')} FPS  "
+                      f"{sample.get('process') or '-'}")
+            print(ok(f"解析到 {hud['sample_count']} 条帧率样本"))
+        else:
+            print(warn("没有捕获到 metal-HUD 日志行"))
+            print(c("  如果此刻没有游戏在跑，这是正常的。", C_DIM))
+            print(c("  先 mtl start 名称 --game，再启动游戏，然后重跑本命令。", C_DIM))
+        if hud.get("stderr"):
+            print(c("  log stream: " + hud["stderr"], C_DIM))
     return 0
 
 
@@ -865,6 +993,7 @@ def cmd_collect(args) -> int:
         thermal_enabled=not args.no_thermal,
         password_fd=args.password_fd,
         soc_info=not args.no_soc_info,
+        game_filter=getattr(args, "game_filter", None),
     )
 
 
@@ -881,6 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
   mtl mark "桌面风扇开启"   打点
   mtl stop                 结束并生成报告
   mtl report --open        重新生成并打开报告
+
+记帧率:
+  mtl start 名称 --game      同时记录游戏 FPS（Metal HUD）
+  mtl doctor --game          实测帧率采集链路
 
 数据位置:
   mtl paths                查看配置/数据/状态目录（XDG）
@@ -901,11 +1034,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="采样间隔，默认 2000（毫秒），也可写 2s / 500ms")
     p.add_argument("--no-thermal", action="store_true", help="不采集 Thermal Pressure（免 sudo）")
     p.add_argument("--no-soc-info", action="store_true", help="不在每行附带 SoC 信息")
+    p.add_argument(
+        "--game", nargs="?", const="", default=None, metavar="进程名",
+        help="记录游戏帧率（Metal HUD）。可留空自动识别，或指定进程名，如 --game Ryujinx",
+    )
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("stop", help="停止实验、整理数据并生成报告")
     p.add_argument("session", nargs="?", help="实验目录名（默认当前进行中的）")
     p.add_argument("--open", action="store_true", help="结束后自动打开报告")
+    p.add_argument("--force", action="store_true", help="允许再次收尾一个已经结束的实验")
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("status", help="查看当前采集状态")
@@ -927,6 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="环境自检")
     p.add_argument("--thermal", action="store_true", help="实跑一次 powermetrics 校验解析")
+    p.add_argument("--game", action="store_true", help="实测 Metal HUD 帧率链路（会临时开关环境变量并还原）")
     p.add_argument("--interval", default="1000", help="自检采样间隔")
     p.set_defaults(func=cmd_doctor)
 
@@ -945,6 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-thermal", action="store_true")
     p.add_argument("--no-soc-info", action="store_true")
     p.add_argument("--password-fd", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--game-filter", default=None, help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_collect)
 
     return parser

@@ -14,11 +14,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import fps as fps_mod
 from . import macmon as macmon_mod
 from .events import Event, load_events
 from .macmon import CANONICAL_FIELDS, MacmonSample
 from .powermetrics import UNKNOWN_RANK, ThermalSample, parse_log_file
-from .storage import EVENTS, SessionPaths, iter_jsonl, parse_timestamp, read_json, write_csv
+from .storage import (
+    EVENTS,
+    SessionPaths,
+    iter_jsonl,
+    parse_timestamp,
+    read_json,
+    write_csv,
+)
 
 THERMAL_SAMPLES_FILE = "powermetrics.samples.jsonl"
 
@@ -31,6 +39,10 @@ MERGED_HEADER: tuple[str, ...] = (
     "thermal_pressure",
     "thermal_pressure_raw",
     "thermal_pressure_age_s",
+    "fps",
+    "fps_1pct",
+    "fps_age_s",
+    "game_process",
 )
 
 
@@ -40,6 +52,7 @@ class SessionData:
     metadata: dict[str, Any] = field(default_factory=dict)
     macmon: list[MacmonSample] = field(default_factory=list)
     thermal: list[ThermalSample] = field(default_factory=list)
+    fps: list[dict[str, Any]] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -131,12 +144,29 @@ def _load_thermal(paths: SessionPaths, warnings: list[str]) -> list[ThermalSampl
     return located if len(located) != len(samples) else samples
 
 
+def _load_fps(paths: SessionPaths, warnings: list[str]) -> list[dict[str, Any]]:
+    """帧率样本来自采集时解析的 hud.log，每条带真实到达时刻。"""
+    samples: list[dict[str, Any]] = []
+    bad = 0
+    for record in iter_jsonl(paths.fps_samples):
+        ts = parse_timestamp(record.get("timestamp"))
+        if ts is None:
+            bad += 1
+            continue
+        samples.append({**record, "ts": ts})
+    samples.sort(key=lambda s: s["ts"])
+    if bad:
+        warnings.append(f"fps.jsonl 中有 {bad} 条样本时间戳不可用，已跳过（原始日志保留）")
+    return samples
+
+
 def load_session(paths: SessionPaths) -> SessionData:
     metadata = read_json(paths.metadata) or {}
     warnings: list[str] = []
     data = SessionData(paths=paths, metadata=metadata, warnings=warnings)
     data.macmon = _load_macmon(paths, warnings)
     data.thermal = _load_thermal(paths, warnings)
+    data.fps = _load_fps(paths, warnings)
     data.events = load_events(paths.path(EVENTS), data.started_at)
     return data
 
@@ -165,15 +195,54 @@ def _asof_thermal(
     return found, age
 
 
+def _asof_fps(
+    samples: list[dict[str, Any]], ts: datetime, max_age_s: float
+) -> tuple[dict[str, Any] | None, float | None]:
+    """取不晚于 ts 的最近一条帧率样本（不插值）。"""
+    lo, hi = 0, len(samples) - 1
+    found = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if samples[mid]["ts"] <= ts:
+            found = samples[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if found is None:
+        return None, None
+    age = (ts - found["ts"]).total_seconds()
+    if age > max_age_s:
+        return None, age
+    return found, age
+
+
 def build_merged_rows(data: SessionData) -> list[dict[str, Any]]:
-    """并集时间轴：macmon 样本 + thermal 样本各占一行，按真实时间戳排序。"""
+    """并集时间轴：macmon / thermal / fps 各自按真实时间戳占一行，再按时间排序。
+
+    非本源的列一律留空，只有「某个采样时刻离该值足够近」时才填 as-of 值，
+    并写出 age。缺失就是缺失，不插值。
+    """
     start = data.started_at
     thermal = data.thermal_sortable()
+    fps_samples = data.fps
     max_age = max(4 * data.interval_s, 10.0)
+    fps_max_age = max(2 * data.interval_s, 4.0)
     rows: list[dict[str, Any]] = []
 
     def elapsed(ts: datetime) -> float | None:
         return None if start is None else round((ts - start).total_seconds(), 3)
+
+    def fps_columns(ts: datetime) -> dict[str, Any]:
+        match, age = _asof_fps(fps_samples, ts, fps_max_age)
+        if match is None:
+            return {"fps": "", "fps_1pct": "", "fps_age_s": "" if age is None else round(age, 3),
+                    "game_process": ""}
+        return {
+            "fps": "" if match.get("fps") is None else round(float(match["fps"]), 2),
+            "fps_1pct": "" if match.get("fps_1pct") is None else round(float(match["fps_1pct"]), 2),
+            "fps_age_s": "" if age is None else round(age, 3),
+            "game_process": match.get("process") or "",
+        }
 
     for sample in data.macmon:
         matched, age = _asof_thermal(thermal, sample.ts, max_age)
@@ -185,6 +254,7 @@ def build_merged_rows(data: SessionData) -> list[dict[str, Any]]:
             "thermal_pressure": matched.level if matched else "",
             "thermal_pressure_raw": "",
             "thermal_pressure_age_s": "" if age is None else round(age, 3),
+            **fps_columns(sample.ts),
         }
         for name in CANONICAL_FIELDS:
             value = sample.get(name)
@@ -202,6 +272,25 @@ def build_merged_rows(data: SessionData) -> list[dict[str, Any]]:
                 "thermal_pressure_raw": sample.raw_level,
                 "thermal_pressure_age_s": 0.0,
                 **{name: "" for name in CANONICAL_FIELDS},
+                **fps_columns(sample.ts),
+            }
+        )
+
+    for sample in fps_samples:
+        rows.append(
+            {
+                "row_ts_utc": sample["ts"].isoformat(timespec="milliseconds"),
+                "row_ts_local": sample["ts"].astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "elapsed_s": elapsed(sample["ts"]),
+                "source": "metal-hud",
+                **{name: "" for name in CANONICAL_FIELDS},
+                "thermal_pressure": "",
+                "thermal_pressure_raw": "",
+                "thermal_pressure_age_s": "",
+                "fps": "" if sample.get("fps") is None else round(float(sample["fps"]), 2),
+                "fps_1pct": "" if sample.get("fps_1pct") is None else round(float(sample["fps_1pct"]), 2),
+                "fps_age_s": 0.0,
+                "game_process": sample.get("process") or "",
             }
         )
 
@@ -365,11 +454,13 @@ def summary(data: SessionData) -> dict[str, Any]:
         "temperatures": temperature_stats(data),
         "power": power_stats(data),
         "thermal": thermal_durations(data),
+        "fps": fps_mod.summarize(data.fps),
         "integrity": sampling_integrity(data),
         "events": data.events,
         "warnings": data.warnings,
         "raw_counts": {
             "macmon_lines": len(data.macmon),
             "thermal_samples": len(data.thermal),
+            "fps_samples": len(data.fps),
         },
     }

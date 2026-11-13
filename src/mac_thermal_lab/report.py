@@ -29,6 +29,8 @@ C_PCPU = "#4dabf7"
 C_GPU_FREQ = "#9775fa"
 C_USAGE = "#ffd166"
 C_EVENT = "#f06595"
+C_FPS = "#69db7c"
+C_FPS_LOW = "#a9e34b"
 
 POWER_KEYS: tuple[str, ...] = (
     "cpu_power_w",
@@ -123,6 +125,31 @@ def _thermal_missing_text(data: SessionData) -> str:
     )
 
 
+def _fps_missing_text(data: SessionData) -> str:
+    """帧率面板空着时，说清是「没开 --game」还是「开了但没抓到」。"""
+    import html as html_mod
+
+    game = (data.metadata or {}).get("game") or {}
+    if not game.get("enabled"):
+        return (
+            "<b>本次实验未采集游戏帧率</b><br>"
+            "<span style='font-size:11px'>录制时没有加 --game。"
+            "该参数会打开 Metal HUD 的日志开关并读取系统日志里的逐秒帧率。</span>"
+        )
+    error = game.get("error")
+    if error:
+        return (
+            "<b>帧率采集失败</b><br>"
+            f"<span style='font-size:11px'>{html_mod.escape(str(error))}</span><br>"
+            "<span style='font-size:11px'>可用 <code>mtl doctor --game</code> 单独验证</span>"
+        )
+    return (
+        "<b>没有捕获到 Metal HUD 的帧率数据</b><br>"
+        "<span style='font-size:11px'>HUD 只对 Metal 呈现的应用生效，且游戏必须在设置环境变量<b>之后</b>启动；"
+        "菜单界面等场景也可能不产生日志。原始的 log stream 输出见 hud.log</span>"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 图表
 # --------------------------------------------------------------------------- #
@@ -133,18 +160,19 @@ def build_figure(data: SessionData) -> go.Figure:
     events = data.events
 
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.075,
-        row_heights=[0.26, 0.26, 0.16, 0.26],
+        vertical_spacing=0.062,
+        row_heights=[0.23, 0.23, 0.13, 0.21, 0.20],
         subplot_titles=(
             "温度 Temperature",
             "功耗 Power",
             "macOS Thermal Pressure",
             "频率与负载 Frequency / Load",
+            "帧率 FPS (Metal HUD)",
         ),
-        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}], [{}]],
     )
 
     # ---- 面板 1：温度 ----
@@ -271,13 +299,60 @@ def build_figure(data: SessionData) -> go.Figure:
         showgrid=False, zeroline=False,
     )
 
+    # ---- 面板 5：帧率（Metal HUD）----
+    fps_samples = data.fps
+    if fps_samples:
+        xs = [_local_naive(sample["ts"]) for sample in fps_samples]
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=[sample.get("fps") for sample in fps_samples],
+                name="帧率 (FPS)", mode="lines",
+                line=dict(color=C_FPS, width=1.8),
+                customdata=[[sample.get("process") or "-",
+                             sample.get("interval_ms"),
+                             sample.get("gpu_ms")] for sample in fps_samples],
+                hovertemplate=(
+                    "%{y:.1f} FPS<br>帧间隔 %{customdata[1]:.2f} ms<br>"
+                    "GPU %{customdata[2]:.2f} ms<extra>%{customdata[0]}</extra>"
+                ),
+                connectgaps=False,
+            ),
+            row=5, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=[sample.get("fps_1pct") for sample in fps_samples],
+                name="1% low (FPS)", mode="lines",
+                line=dict(color=C_FPS_LOW, width=1.2, dash="dot"),
+                hovertemplate="1% low %{y:.1f} FPS<extra></extra>",
+                connectgaps=False,
+            ),
+            row=5, col=1,
+        )
+        fps_values = [s["fps"] for s in fps_samples if s.get("fps") is not None]
+        if fps_values:
+            top = max(fps_values) * 1.12
+            fig.update_yaxes(range=[0, top], row=5, col=1)
+    fig.update_yaxes(title_text="FPS", row=5, col=1, gridcolor=GRID, zeroline=False)
+
+    if not fps_samples:
+        fig.add_annotation(
+            x=0.5, y=0.11, xref="paper", yref="paper", showarrow=False,
+            text=_fps_missing_text(data),
+            align="center",
+            font=dict(color=MUTED, size=13),
+        )
+
     # ---- 事件竖线 ----
     span_s = 1.0
     if len(macmon) >= 2:
         span_s = max(1.0, (macmon[-1].ts - macmon[0].ts).total_seconds())
     elif thermal:
         span_s = max(1.0, (thermal[-1].ts - thermal[0].ts).total_seconds())
-
+    elif len(data.fps) >= 2:
+        span_s = max(1.0, (data.fps[-1]["ts"] - data.fps[0]["ts"]).total_seconds())
     prev_frac: float | None = None
     level = 0
     for index, event in enumerate(events):
@@ -326,9 +401,9 @@ def build_figure(data: SessionData) -> go.Figure:
         )
 
     if not thermal:
-        # 放在 Thermal 面板区域内（第 3 行约占 paper 0.26~0.42）
+        # 第 3 行（Thermal）在 paper 坐标里大约 0.40~0.51
         fig.add_annotation(
-            x=0.5, y=0.33, xref="paper", yref="paper", showarrow=False,
+            x=0.5, y=0.455, xref="paper", yref="paper", showarrow=False,
             text=_thermal_missing_text(data),
             align="center",
             font=dict(color=MUTED, size=13),
@@ -340,7 +415,7 @@ def build_figure(data: SessionData) -> go.Figure:
         plot_bgcolor=PANEL,
         font=dict(family='-apple-system, "SF Pro Text", "PingFang SC", sans-serif',
                   color=TEXT, size=12),
-        height=1080,
+        height=1240,
         margin=dict(l=72, r=72, t=120, b=64),
         hovermode="x unified",
         dragmode="pan",
@@ -354,7 +429,7 @@ def build_figure(data: SessionData) -> go.Figure:
         gridcolor=GRID, showspikes=True, spikemode="across", spikethickness=1,
         spikecolor=MUTED, spikedash="dot", rangeslider_visible=False,
     )
-    fig.update_xaxes(title_text="本机时间", row=4, col=1)
+    fig.update_xaxes(title_text="本机时间", row=5, col=1)
     return fig
 
 
@@ -478,26 +553,33 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
     if thermal.get("by_level"):
         dominant = max(thermal["by_level"].items(), key=lambda kv: kv[1])[0]
 
-    kpis = "".join(
-        [
-            _kpi("实验时长", fmt_duration(summary.get("span_seconds")),
-                 f"采样间隔 {summary['interval_ms']/1000:.1f}s"),
-            _kpi("CPU 温度", _fmt(cpu_t.get("mean"), 1, " °C"),
-                 f"最高 {_fmt(cpu_t.get('max'), 1, ' °C')} / 最低 {_fmt(cpu_t.get('min'), 1, ' °C')}"),
-            _kpi("GPU 温度", _fmt(gpu_t.get("mean"), 1, " °C"),
-                 f"最高 {_fmt(gpu_t.get('max'), 1, ' °C')}"),
-            _kpi("CPU 功耗", _fmt(cpu_p.get("mean"), 2, " W"),
-                 f"峰值 {_fmt(cpu_p.get('max'), 2, ' W')}"),
-            _kpi("GPU 功耗", _fmt(gpu_p.get("mean"), 2, " W"),
-                 f"峰值 {_fmt(gpu_p.get('max'), 2, ' W')}"),
-            _kpi("All Power", _fmt(all_p.get("mean"), 2, " W"),
-                 f"能量 ≈ {_fmt(all_p.get('energy_wh'), 2, ' Wh')}"),
-            _kpi("Thermal 主导状态", dominant,
-                 f"切换 {thermal.get('changes', 0)} 次"),
-            _kpi("采样点", f"{integrity['macmon']['count']}",
-                 f"缺失 {_fmt(integrity['macmon'].get('missing_pct'), 1, '%')}"),
-        ]
-    )
+    kpi_items = [
+        _kpi("实验时长", fmt_duration(summary.get("span_seconds")),
+             f"采样间隔 {summary['interval_ms']/1000:.1f}s"),
+        _kpi("CPU 温度", _fmt(cpu_t.get("mean"), 1, " °C"),
+             f"最高 {_fmt(cpu_t.get('max'), 1, ' °C')} / 最低 {_fmt(cpu_t.get('min'), 1, ' °C')}"),
+        _kpi("GPU 温度", _fmt(gpu_t.get("mean"), 1, " °C"),
+             f"最高 {_fmt(gpu_t.get('max'), 1, ' °C')}"),
+        _kpi("CPU 功耗", _fmt(cpu_p.get("mean"), 2, " W"),
+             f"峰值 {_fmt(cpu_p.get('max'), 2, ' W')}"),
+        _kpi("GPU 功耗", _fmt(gpu_p.get("mean"), 2, " W"),
+             f"峰值 {_fmt(gpu_p.get('max'), 2, ' W')}"),
+        _kpi("All Power", _fmt(all_p.get("mean"), 2, " W"),
+             f"能量 ≈ {_fmt(all_p.get('energy_wh'), 2, ' Wh')}"),
+        _kpi("Thermal 主导状态", dominant,
+             f"切换 {thermal.get('changes', 0)} 次"),
+        _kpi("采样点", f"{integrity['macmon']['count']}",
+             f"缺失 {_fmt(integrity['macmon'].get('missing_pct'), 1, '%')}"),
+    ]
+    fps_summary = summary.get("fps") or {}
+    if fps_summary.get("fps_samples"):
+        kpi_items.insert(
+            6,
+            _kpi("平均帧率", _fmt(fps_summary.get("fps_avg"), 1, " FPS"),
+                 f"1% low {_fmt(fps_summary.get('fps_1pct_low'), 1)} · "
+                 f"最低 {_fmt(fps_summary.get('fps_min'), 1)}"),
+        )
+    kpis = "".join(kpi_items)
 
     # 温度表
     def temp_row(label: str, stats: dict[str, float] | None) -> list[str]:
@@ -610,11 +692,20 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
     if thermal_meta.get("error"):
         thermal_state += f"（{thermal_meta['error']}）"
 
+    game_state = ""
+    game_meta_top = meta.get("game") or {}
+    if game_meta_top.get("enabled"):
+        process = game_meta_top.get("process")
+        game_state = f' · 帧率采集 已启用{"（" + process + "）" if process else ""}'
+        if game_meta_top.get("error"):
+            game_state = f" · 帧率采集 失败（{game_meta_top['error']}）"
+
     sub = (
         f'{host_chips} · macOS {host.get("os_version", "?")} · 本机时间 {_range_text(summary)}<br>'
         f'会话 <code>{data.paths.name}</code> · 采样间隔 '
         f'<code>{summary["interval_ms"]/1000:.1f}s</code> · '
-        f'macmon <code>{_clean_version(tools.get("macmon"))}</code> · Thermal 采集 {thermal_state}'
+        f'macmon <code>{_clean_version(tools.get("macmon"))}</code> · '
+        f'Thermal 采集 {thermal_state}{game_state}'
     )
 
     notes = """
@@ -630,6 +721,23 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
   <b>缺失</b>：曲线中的断口即采样缺失，未做插值或补点。
 </div>
 """
+
+    fps_card = ""
+    if fps_summary.get("fps_samples"):
+        fps_rows = [
+            ["平均帧率", _fmt(fps_summary.get("fps_avg"), 1, " FPS")],
+            ["1% low", _fmt(fps_summary.get("fps_1pct_low"), 1, " FPS")],
+            ["最低 / 最高", f"{_fmt(fps_summary.get('fps_min'), 1)} / "
+                            f"{_fmt(fps_summary.get('fps_max'), 1)} FPS"],
+            ["识别进程", "、".join(fps_summary.get("processes") or []) or "-"],
+            ["采样条数", str(fps_summary.get("fps_samples"))],
+        ]
+        fps_card = (
+            '<div class="card"><h2>帧率统计（Metal HUD）</h2>'
+            + _table(["指标", "数值"], fps_rows)
+            + "</div>"
+        )
+    game_meta = meta.get("game") or {}
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -654,6 +762,7 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
     <div class="card"><h2>温度统计</h2>{temp_table}</div>
     <div class="card"><h2>功耗统计</h2>{power_table}</div>
   </div>
+  {fps_card}
   <div class="grid2">
     <div class="card"><h2>Thermal Pressure 分布</h2>{thermal_table}</div>
     <div class="card"><h2>采样完整性</h2>{integrity_table}</div>
