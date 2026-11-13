@@ -71,3 +71,12 @@ def test_short_reason_maps_sudo_errors():
     assert "密码" in _short_thermal_reason(["sudo: a password is required"], 1)
     assert "拒绝" in _short_thermal_reason(["sudo: Operation not permitted"], 1)
     assert "退出码 9" in _short_thermal_reason([], 9)
+
+
+def test_password_rejected_wins_over_missing_password():
+    """sudo 密码被拒时，尾部还会跟一句 no password was provided，别把原因说成"未授权"。"""
+    from mac_thermal_lab.collector import _short_thermal_reason
+
+    tail = ["Sorry, try again.", "sudo: no password was provided", "sudo: 1 incorrect password attempt"]
+    reason = _short_thermal_reason(tail, 1)
+    assert "密码错误" in reason

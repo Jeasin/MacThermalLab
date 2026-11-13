@@ -42,10 +42,12 @@ MAX_MACMON_RESTARTS = 3
 def _short_thermal_reason(tail: list[str], returncode: int | None) -> str:
     """把 sudo / powermetrics 的原始报错压缩成一句人能看懂的失败原因。"""
     blob = " ".join(tail).lower()
+    # 先判「密码被拒」：这时 sudo 随后还会补一句 no password was provided，
+    # 那是重试时读到 EOF 的连带输出，不是真正的原因
+    if "sorry, try again" in blob or "incorrect password" in blob:
+        return "sudo 密码错误（powermetrics 未启动）"
     if "a password is required" in blob or "no password was provided" in blob:
         return "sudo 未授权：powermetrics 需要管理员密码"
-    if "sorry, try again" in blob or "incorrect password" in blob:
-        return "sudo 密码错误"
     if "operation not permitted" in blob:
         return "sudo 被系统拒绝，无法执行 powermetrics"
     if "not found" in blob:
