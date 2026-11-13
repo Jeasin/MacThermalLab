@@ -135,7 +135,7 @@ mtl paths
 ├── powermetrics.samples.jsonl 采集时顺带解析的缓存（用于补缺失时间戳）
 ├── hud.log                    log stream 的原始 ndjson（仅在 --game 时产生）
 ├── hud.err.log                log stream 的 stderr
-├── fps.jsonl                  逐秒帧率样本（fps / 1% low / 帧间隔 / GPU 时间）
+├── fps.jsonl                  帧率样本（fps / 窗口帧数 / 平均帧间隔 / 内存 MB）
 ├── events.jsonl               人工事件
 ├── merged.csv                 三路数据按时间戳对齐后的并集
 └── dashboard.html             离线可交互报告
@@ -209,7 +209,7 @@ mtl migrate             # 执行
 | `thermal_pressure_raw` | **仅**在 powermetrics 真实样本行上出现原始状态文本 |
 | `thermal_pressure_age_s` | as-of 数据年龄，超龄时留空（默认阈值为 4 倍采样间隔或 10s） |
 | `fps` | as-of 取向最近一条 Metal HUD 帧率；`source=metal-hud` 的行是本行自己的值 |
-| `fps_1pct` | 该秒内最差 1% 帧间隔换算出的帧率 |
+| `fps_1pct` | 1% low；逐帧间隔拿不到时留空（汇总层用窗口近似，见下） |
 | `fps_age_s` | 帧率的 as-of 年龄（HUD 每秒一条，阈值默认为 2 倍采样间隔或 4s） |
 | `game_process` | 该帧率来自哪个进程（HUD 日志里的进程名） |
 
@@ -230,8 +230,22 @@ mtl start 王国之泪 --game Ryujinx  # 指定进程名（子串匹配）
 
 原理：Apple 的 HUD 在 `MTL_HUD_ENABLED=1` 时显示浮层，再加上
 `MTL_HUD_LOG_ENABLED=1` 后，每秒往统一日志写一行
-`metal-HUD: 首帧号,丢帧,内存MB,帧间隔ms,GPU时间ms,...`。
+
+```
+metal-HUD: 首帧号,预计丢帧,进程内存MB,逐帧(间隔ms,GPU时间ms)…
+```
+
 `mtl` 用 `log stream` 读这一行并解析成 `fps.jsonl`——不需要录屏权限，也不做 OCR。
+
+两个实测坑（已在代码里处理）：
+
+- 行尾那段逐帧明细是一个 `%s` 参数，系统日志会把它整段脱敏成 `<private>`，
+  所以逐帧间隔通常拿不到。帧率改由**帧号差分**算：两条日志的帧号差 ÷ 真实时间差，
+  一个点对应一个采样窗口（约 0.5s，含 20–60 帧）。
+  逐帧间隔缺失时 `1% low` 退化为「按帧数加权的最慢 1% 帧」近似值，报告里会标「≈」。
+- `log stream` 会把同一条记录投递**两份**（一份 `subsystem` 为空、一份
+  `com.apple.metal.hud`）。解析器按帧号去重，否则每秒会多一条算不出帧率的空记录，
+  报告里的折线会被空值切成碎片、一条线都看不见。
 
 ### 三条必须遵守的使用条件
 
@@ -252,9 +266,10 @@ mtl doctor --game      # 实测一次：开关环境变量 → log stream 3s →
 - 报告里帧率面板会直接写明原因（没开 `--game` / 环境变量设不上 / 没抓到 HUD 行）。
 - 原始 `log stream` 输出都在 `hud.log`，可以自己翻。
 
-> **未实测提醒**：这条链路的解析逻辑用合成样本覆盖了（含格式容错、帧号差分兜底），
-> 但开发环境的沙箱禁止执行 `log` 与 `launchctl setenv`，所以**没有在真实游戏上跑通过**。
-> 第一次用请先跑 `mtl doctor --game` 确认。
+> **实测情况**：已在《塞尔达传说 王国之泪》（`totk-native`）上跑通 17 分钟，
+> 抓到 1564 条帧率样本（约 59.7 FPS 平均）。解析逻辑另有合成样本测试覆盖
+> 格式容错、重复投递去重、帧号归零重建基线等分支。
+> 换游戏/换机型时，第一次仍建议先跑 `mtl doctor --game` 确认链路。
 
 ---
 
@@ -267,7 +282,8 @@ mtl doctor --game      # 实测一次：开关环境变量 → log stream 3s →
 - **面板 2 功耗**：CPU / GPU / All Power（实线），Sys Power（点线，单独标注口径）。
 - **面板 3 Thermal Pressure**：状态色带 + 阶梯线，Nominal / Moderate / Heavy / Trapping / Unknown。
 - **面板 4 频率与负载**：E/S/GPU 频率（左轴 MHz）+ CPU/GPU 使用率（右轴 %）。
-- **面板 5 帧率**：每秒帧率（实线）+ 1% low（点线），悬停显示帧间隔与 GPU 时间。
+- **面板 5 帧率**：帧率曲线（实线）+ 1% low（点线；逐帧间隔被日志脱敏时改为一条
+  「≈ 窗口近似」的水平参考线），悬停显示该点覆盖的窗口时长、帧数与平均帧间隔。
 - **事件**：贯穿所有面板的虚线，顶部带标签，悬停显示备注。
 - 时间轴统一，支持框选缩放、拖动平移、`x unified` 悬停；缺失处曲线断开，不插值。
 

@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from . import fps as fps_mod
 from .analysis import SessionData, write_merged_csv
 from .storage import fmt_duration, fmt_local, local_tz
 
@@ -300,41 +301,67 @@ def build_figure(data: SessionData) -> go.Figure:
     )
 
     # ---- 面板 5：帧率（Metal HUD）----
-    fps_samples = data.fps
+    # 算不出帧率的行（第一条、游戏重启后的第一条）留着会把折线打断：
+    # connectgaps=False 时每段都被空值切开，画面上就是一条线也看不到。
+    fps_samples = [sample for sample in data.fps if sample.get("fps") is not None]
+    fps_low_samples = [sample for sample in fps_samples if sample.get("fps_1pct") is not None]
+    fps_summary = fps_mod.summarize(data.fps)
     if fps_samples:
         xs = [_local_naive(sample["ts"]) for sample in fps_samples]
+        customdata = []
+        for sample in fps_samples:
+            window_s = sample.get("window_s")
+            frames = sample.get("frames")
+            window_text = (
+                f"窗口 {window_s:.2f}s / {frames} 帧"
+                if window_s and frames
+                else "-"
+            )
+            interval_ms = sample.get("interval_ms")
+            interval_text = f"平均帧间隔 {interval_ms:.1f} ms" if interval_ms else "-"
+            customdata.append([sample.get("process") or "-", window_text, interval_text])
         fig.add_trace(
             go.Scatter(
                 x=xs,
-                y=[sample.get("fps") for sample in fps_samples],
+                y=[sample["fps"] for sample in fps_samples],
                 name="帧率 (FPS)", mode="lines",
-                line=dict(color=C_FPS, width=1.8),
-                customdata=[[sample.get("process") or "-",
-                             sample.get("interval_ms"),
-                             sample.get("gpu_ms")] for sample in fps_samples],
+                line=dict(color=C_FPS, width=1.6),
+                customdata=customdata,
                 hovertemplate=(
-                    "%{y:.1f} FPS<br>帧间隔 %{customdata[1]:.2f} ms<br>"
-                    "GPU %{customdata[2]:.2f} ms<extra>%{customdata[0]}</extra>"
+                    "%{y:.1f} FPS<br>%{customdata[1]}<br>"
+                    "%{customdata[2]}<extra>%{customdata[0]}</extra>"
                 ),
-                connectgaps=False,
+                connectgaps=True,
             ),
             row=5, col=1,
         )
-        fig.add_trace(
-            go.Scatter(
-                x=xs,
-                y=[sample.get("fps_1pct") for sample in fps_samples],
-                name="1% low (FPS)", mode="lines",
-                line=dict(color=C_FPS_LOW, width=1.2, dash="dot"),
-                hovertemplate="1% low %{y:.1f} FPS<extra></extra>",
-                connectgaps=False,
-            ),
-            row=5, col=1,
-        )
-        fps_values = [s["fps"] for s in fps_samples if s.get("fps") is not None]
+        if fps_low_samples:
+            fig.add_trace(
+                go.Scatter(
+                    x=[_local_naive(sample["ts"]) for sample in fps_low_samples],
+                    y=[sample["fps_1pct"] for sample in fps_low_samples],
+                    name="1% low (FPS)", mode="lines",
+                    line=dict(color=C_FPS_LOW, width=1.2, dash="dot"),
+                    hovertemplate="1% low %{y:.1f} FPS<extra></extra>",
+                    connectgaps=True,
+                ),
+                row=5, col=1,
+            )
+        fps_values = [sample["fps"] for sample in fps_samples]
         if fps_values:
-            top = max(fps_values) * 1.12
+            top = max(max(fps_values), fps_summary.get("fps_1pct_low") or 0) * 1.12
             fig.update_yaxes(range=[0, top], row=5, col=1)
+        if not fps_low_samples and fps_summary.get("fps_1pct_low") is not None:
+            # 逐帧间隔被日志脱敏成 <private> 时算不了真 1% low，
+            # 退化成按帧数加权慢帧的水平参考线，并点明是近似值。
+            low = fps_summary["fps_1pct_low"]
+            fig.add_hline(
+                y=low, row=5, col=1,
+                line=dict(color=C_FPS_LOW, width=1.2, dash="dot"),
+                annotation_text=f"1% low ≈ {low:.1f}（近似）",
+                annotation_position="right",
+                annotation_font=dict(size=10, color=C_FPS_LOW),
+            )
     fig.update_yaxes(title_text="FPS", row=5, col=1, gridcolor=GRID, zeroline=False)
 
     if not fps_samples:
@@ -572,11 +599,13 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
              f"缺失 {_fmt(integrity['macmon'].get('missing_pct'), 1, '%')}"),
     ]
     fps_summary = summary.get("fps") or {}
+    fps_low_is_approx = fps_summary.get("fps_1pct_source") not in (None, "frame")
     if fps_summary.get("fps_samples"):
         kpi_items.insert(
             6,
             _kpi("平均帧率", _fmt(fps_summary.get("fps_avg"), 1, " FPS"),
-                 f"1% low {_fmt(fps_summary.get('fps_1pct_low'), 1)} · "
+                 f"1% low {'≈ ' if fps_low_is_approx else ''}"
+                 f"{_fmt(fps_summary.get('fps_1pct_low'), 1)} · "
                  f"最低 {_fmt(fps_summary.get('fps_min'), 1)}"),
         )
     kpis = "".join(kpi_items)
@@ -718,15 +747,19 @@ def render_html(data: SessionData, summary: dict[str, Any], plot_html: str) -> s
   Thermal 面板的色带只覆盖真实采样区间。merged.csv 中的 <code>thermal_pressure</code>
   为 as-of 取值（取不晚于该行的最近一次真实样本），其年龄见 <code>thermal_pressure_age_s</code>，
   <code>thermal_pressure_raw</code> 列只在 powermetrics 真实样本行上出现。<br>
-  <b>缺失</b>：曲线中的断口即采样缺失，未做插值或补点。
+  <b>缺失</b>：曲线中的断口即采样缺失，未做插值或补点。<br>
+  <b>帧率</b>：Metal HUD 的逐帧明细在系统日志里被脱敏成 <code>&lt;private&gt;</code>，
+  所以帧率由相邻两条日志的帧号差÷时间差算出，一个点对应一个采样窗口；
+  1% low 在拿不到逐帧间隔时退化为按帧数加权的最慢 1% 帧，是近似值。
 </div>
 """
 
     fps_card = ""
     if fps_summary.get("fps_samples"):
+        low_suffix = "（近似）" if fps_low_is_approx else ""
         fps_rows = [
             ["平均帧率", _fmt(fps_summary.get("fps_avg"), 1, " FPS")],
-            ["1% low", _fmt(fps_summary.get("fps_1pct_low"), 1, " FPS")],
+            [f"1% low{low_suffix}", _fmt(fps_summary.get("fps_1pct_low"), 1, " FPS")],
             ["最低 / 最高", f"{_fmt(fps_summary.get('fps_min'), 1)} / "
                             f"{_fmt(fps_summary.get('fps_max'), 1)} FPS"],
             ["识别进程", "、".join(fps_summary.get("processes") or []) or "-"],

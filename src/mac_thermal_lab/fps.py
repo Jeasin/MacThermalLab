@@ -5,12 +5,17 @@ Apple 的 Metal HUD 在有 `MTL_HUD_ENABLED=1` 时显示浮层；再加上
 
     metal-HUD: <首帧号>,<估计丢帧>,<进程内存 MB>,<帧间隔 ms>,<GPU 时间 ms>,...
 
-前三个是标量，后面是每帧一对「呈现间隔, GPU 时间」，一行的帧对数不固定。
-因此这里同时算两种口径，互为交叉校验：
+前三个是标量，后面是每帧一对「呈现间隔, GPU 时间」。但后半段在实际日志里
+是以单个 ``%s`` 输出的，`log stream` 会把它整段脱敏成 ``<private>``：
 
-- ``fps``       由帧间隔均值换算（1000 / 平均间隔），精度取决于 HUD 的毫秒值
-- ``frames``    这一秒实际出现的帧对数，对格式细节不敏感
-- ``fps_1pct``  按最差 1% 的帧间隔换算，即常说的 1% low
+    metal-HUD: 38,1635.59,3536.35<private>
+
+所以逐帧间隔通常拿不到，只有帧号是可靠的。于是主口径是**帧号差分**：
+
+- ``fps``        两行之间涨了多少帧 ÷ 两行的真实时间差
+- ``frames``     该窗口内呈现的帧数（帧号差）
+- ``interval_ms`` 该窗口的平均呈现间隔（1000 × 窗口秒数 / 帧数）
+- ``fps_1pct``   仅当逐帧间隔没被脱敏时才有值，否则为 None（由汇总层做近似）
 
 数据来源是 `log stream`，不是截屏 OCR：HUD 本来就把这些数字送去统一日志，
 所以既不需要屏幕录制权限，也不用识别浮层文字。
@@ -36,6 +41,8 @@ HUD_ENV_KEYS = ("MTL_HUD_ENABLED", "MTL_HUD_LOG_ENABLED", "MTL_HUD_LOGGING_ENABL
 LOG_BIN = "/usr/bin/log"
 
 _NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+# 日志脱敏占位符，例如 <private>、<mask.hash: 'abc'>
+_REDACTION_RE = re.compile(r"<[^<>]*>")
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +167,9 @@ def parse_hud_message(message: str | None) -> dict | None:
     body = message[index + len(HUD_LOG_KEY):].lstrip()
     if body.startswith(":"):
         body = body[1:]
+    # 行尾那段逐帧明细是一个 %s 参数，日志里常被脱敏成 <private> 或
+    # <mask.hash: ...>；它不是数据，删掉才不会把它黏在最后一个数字上。
+    body = _REDACTION_RE.sub("", body)
 
     tokens = [token.strip() for token in body.split(",")]
     while tokens and not tokens[-1]:
@@ -173,7 +183,9 @@ def parse_hud_message(message: str | None) -> dict | None:
     if values[0] is None:
         return None
 
-    # 前三列是标量：首帧号、丢帧数、进程内存
+    # 前三列是标量：首帧号、预计丢帧、进程内存（Apple 技术讲座的口径）。
+    # 实测日志里第二、三列都随内存增长、且第二列只在内存变化时才变，
+    # 语义可能和讲座里的描述对不上，所以这两个值只原样保留，不参与任何计算。
     frame_no = values[0]
     missed = values[1] if len(values) > 1 else None
     memory_mb = values[2] if len(values) > 2 else None
@@ -245,29 +257,51 @@ class HudStreamParser:
         if process:
             self.seen_processes[process] = self.seen_processes.get(process, 0) + 1
 
-        # 帧号差分是格式变化时的兜底：两行之间涨了多少帧，就是这段时间的帧数
+        # 帧号差分是主口径：两行之间涨了多少帧，就是这段时间的帧数。
+        # 同一条 HUD 记录会被 log stream 投递两次（一份 subsystem 为空、
+        # 一份 com.apple.metal.hud），帧号必然相同——这类重复要丢掉，
+        # 否则每秒会多出一条算不出帧率的空记录，报告里的曲线会被切成碎片。
         fps_by_count = None
+        window_s = None
+        counted_frames = parsed.get("frames")
         frame_no = parsed.get("frame_no")
-        if frame_no is not None and self._last_frame is not None and self._last_ts is not None:
-            delta_frames = frame_no - self._last_frame
-            delta_s = (ts - self._last_ts).total_seconds()
-            if 0 < delta_s < 10 and delta_frames > 0:
-                fps_by_count = delta_frames / delta_s
         if frame_no is not None:
+            if self._last_frame is not None:
+                if frame_no == self._last_frame:
+                    return None
+                if frame_no < self._last_frame:
+                    # 游戏重启，帧号归零：重建基线，这一条算不出帧率
+                    self._last_frame, self._last_ts = frame_no, ts
+                    return None
+                delta_frames = frame_no - self._last_frame
+                delta_s = (ts - self._last_ts).total_seconds() if self._last_ts else 0.0
+                if 0 < delta_s < 10 and delta_frames > 0:
+                    fps_by_count = delta_frames / delta_s
+                    window_s = delta_s
+                    counted_frames = int(delta_frames)
             self._last_frame = frame_no
             self._last_ts = ts
 
         fps = parsed.get("fps")
         if fps is None:
             fps = fps_by_count
+        if fps is None:
+            # 第一条（或游戏重启后的第一条）没有参照，算不出帧率。
+            # 这种行不带任何可用信息，不写进 fps.jsonl，下游也就不必到处判空。
+            return None
+
+        interval_ms = parsed.get("interval_ms")
+        if interval_ms is None and window_s and counted_frames:
+            interval_ms = window_s * 1000.0 / counted_frames
 
         return {
             "timestamp": iso_utc(ts),
             "process": process,
             "fps": round(fps, 3) if fps is not None else None,
             "fps_1pct": round(parsed["fps_1pct"], 3) if parsed.get("fps_1pct") else None,
-            "frames": parsed.get("frames"),
-            "interval_ms": round(parsed["interval_ms"], 3) if parsed.get("interval_ms") else None,
+            "frames": counted_frames,
+            "window_s": round(window_s, 3) if window_s else None,
+            "interval_ms": round(interval_ms, 3) if interval_ms else None,
             "gpu_ms": round(parsed["gpu_ms"], 3) if parsed.get("gpu_ms") else None,
             "missed": parsed.get("missed"),
             "memory_mb": parsed.get("memory_mb"),
@@ -281,19 +315,77 @@ def dominant_process(seen: dict[str, int]) -> str | None:
     return max(seen.items(), key=lambda item: item[1])[0]
 
 
+def _window_weights(samples: list[dict]) -> list[tuple[float, float]]:
+    """每个采样窗口的 (帧率, 权重)：权重是该窗口贡献了多少帧。
+
+    优先用 HUD 的帧号差；早期版本抓的 fps.jsonl 没有帧数，就用
+    「时间跨度 × 帧率」估出来，好过直接对窗口帧率取分位。
+    """
+    items: list[tuple[float, float]] = []
+    prev_ts = None
+    for sample in samples:
+        fps = sample.get("fps")
+        ts = sample.get("ts")
+        weight = sample.get("frames") or 0
+        if not weight and fps is not None and ts is not None and prev_ts is not None:
+            span = (ts - prev_ts).total_seconds()
+            if 0 < span < 10:
+                weight = fps * span
+        if fps is not None and weight:
+            items.append((fps, weight))
+        if ts is not None:
+            prev_ts = ts
+    return items
+
+
+def _weighted_low(samples: list[dict], share: float = 0.01) -> float | None:
+    """按帧数加权的低帧率分位：帧率从低到高累计帧数，取到占总帧数 ``share`` 处的帧率。
+
+    逐帧间隔拿不到时，这是「最慢的 1% 帧有多慢」最接近的近似——采样窗口越慢，
+    贡献的帧也越少，所以不能对窗口帧率简单取分位（那样会明显偏乐观）。
+    """
+    weighted = _window_weights(samples)
+    total = sum(frames for _, frames in weighted)
+    if total <= 0:
+        return None
+    need = total * share
+    accumulated = 0
+    for fps, frames in sorted(weighted):
+        accumulated += frames
+        if accumulated >= need:
+            return fps
+    return min(fps for fps, _ in weighted)
+
+
 def summarize(samples: list[dict]) -> dict:
+    """汇总帧率。
+
+    1% low 有两个来源：逐帧间隔没被脱敏时用真实的最差 1% 帧间隔；
+    拿不到时退化为按帧数加权的窗口近似，并在 ``fps_1pct_source``
+    里标明，报告据此决定要不要写「近似」。
+    """
     fps_values = [s["fps"] for s in samples if s.get("fps") is not None]
     if not fps_values:
         return {"count": len(samples), "fps_samples": 0}
     ordered = sorted(fps_values)
     low_index = min(len(ordered) - 1, int(round(0.01 * (len(ordered) - 1))))
+    frame_lows = sorted(s["fps_1pct"] for s in samples if s.get("fps_1pct") is not None)
+    if frame_lows:
+        frame_low_index = min(len(frame_lows) - 1, int(round(0.01 * (len(frame_lows) - 1))))
+        fps_1pct_low = frame_lows[frame_low_index]
+        fps_1pct_source = "frame"
+    else:
+        weighted = _weighted_low(samples)
+        fps_1pct_low = weighted if weighted is not None else ordered[low_index]
+        fps_1pct_source = "window" if weighted is not None else "percentile"
     return {
         "count": len(samples),
         "fps_samples": len(fps_values),
         "fps_avg": sum(fps_values) / len(fps_values),
         "fps_min": ordered[0],
         "fps_max": ordered[-1],
-        "fps_1pct_low": ordered[low_index],
+        "fps_1pct_low": fps_1pct_low,
+        "fps_1pct_source": fps_1pct_source,
         "processes": sorted({s.get("process") for s in samples if s.get("process")}),
     }
 

@@ -73,17 +73,17 @@ def test_stream_parser_extracts_sample_and_process():
 
 
 def test_stream_parser_falls_back_to_frame_delta():
-    """帧间隔字段缺失时，用帧号差分兜底，而不是直接丢样本。"""
+    """帧间隔字段缺失时，用帧号差分兜底；第一条没有参照就不落库。"""
     parser = fps.HudStreamParser()
     t0 = datetime(2026, 11, 13, 14, 0, 0, tzinfo=timezone.utc)
     first = parser.feed(_record("metal-HUD: 1000,0,50.0", t0))
-    assert first is not None
-    assert first["fps"] is None  # 第一条没有参照，只能空
+    assert first is None  # 第一条算不出帧率，不写进 fps.jsonl
 
     second = parser.feed(_record("metal-HUD: 1060,0,50.0", t0 + timedelta(seconds=1)))
     assert second is not None
     assert second["fps"] == pytest.approx(60.0, abs=0.01)
     assert second["fps_by_count"] == pytest.approx(60.0, abs=0.01)
+    assert second["frames"] == 60
 
 
 def test_stream_parser_process_filter():
@@ -92,6 +92,73 @@ def test_stream_parser_process_filter():
     message = "metal-HUD: 10,0,10.0,16.7,8.0"
     assert parser.feed(_record(message, ts, process="Safari")) is None
     assert parser.feed(_record(message, ts, process="Ryujinx")) is not None
+
+
+def test_stream_parser_drops_duplicate_log_delivery():
+    """同一条 HUD 记录会被 log stream 投递两份，帧号相同——不能变成两条样本。
+
+    实测日志：一份 subsystem 为空、一份 com.apple.metal.hud，时间戳差 0.1ms。
+    以前两份都落库，第二条算不出帧率，报告里一半的点是空值，折线全断。
+    """
+    parser = fps.HudStreamParser()
+    t0 = datetime(2026, 11, 13, 14, 0, 0, tzinfo=timezone.utc)
+    first = parser.feed(_record("metal-HUD: 1000,0,50.0", t0))
+    assert first is None  # 第一条只用来立基线
+    duplicated = parser.feed(_record("metal-HUD: 1000,0,50.0", t0 + timedelta(milliseconds=0.1)))
+    assert duplicated is None
+    second = parser.feed(_record("metal-HUD: 1030,0,50.0", t0 + timedelta(seconds=0.5)))
+    assert second is not None
+    assert second["fps"] == pytest.approx(60.0, abs=0.01)
+    assert second["frames"] == 30
+    assert second["window_s"] == pytest.approx(0.5, abs=0.01)
+    assert second["interval_ms"] == pytest.approx(16.67, abs=0.05)
+
+
+def test_stream_parser_rebaselines_after_frame_number_reset():
+    """游戏重启后帧号归零：重建基线，不产出负的帧率。"""
+    parser = fps.HudStreamParser()
+    t0 = datetime(2026, 11, 13, 14, 0, 0, tzinfo=timezone.utc)
+    parser.feed(_record("metal-HUD: 90000,0,50.0", t0))
+    restarted = parser.feed(_record("metal-HUD: 3,0,50.0", t0 + timedelta(seconds=1)))
+    assert restarted is None
+    after = parser.feed(_record("metal-HUD: 33,0,50.0", t0 + timedelta(seconds=1.5)))
+    assert after is not None and after["fps"] == pytest.approx(60.0, abs=0.1)
+
+
+def test_real_hud_line_with_redacted_private_tail():
+    """真机日志的后半段被脱敏成 <private>，只剩三个标量，帧率靠帧号差分。"""
+    parser = fps.HudStreamParser()
+    t0 = datetime(2026, 11, 13, 15, 18, 29, tzinfo=timezone(timedelta(hours=8)))
+    parser.feed(_record("metal-HUD: 38,1635.59,3536.35<private>", t0))
+    sample = parser.feed(
+        _record("metal-HUD: 67,1635.59,3536.35<private>", t0 + timedelta(seconds=0.5))
+    )
+    assert sample is not None
+    assert sample["fps"] == pytest.approx(58.0, abs=0.01)
+    assert sample["fps_1pct"] is None  # 逐帧间隔拿不到，只能留空
+    assert sample["memory_mb"] == pytest.approx(3536.35)
+    assert sample["interval_ms"] == pytest.approx(17.24, abs=0.02)
+
+
+def test_summarize_1pct_low_is_weighted_by_frames():
+    """一次短暂卡顿只贡献少量帧，不能仅凭「最低值」就把它算成 1% low。"""
+    samples = [{"fps": 60.0, "frames": 60, "process": "Game"} for _ in range(100)]
+    samples.append({"fps": 5.0, "frames": 2, "process": "Game"})   # 一次 0.4s 的停顿
+    samples += [{"fps": 40.0, "frames": 20, "process": "Game"} for _ in range(10)]
+    result = fps.summarize(samples)
+    assert result["fps_1pct_source"] == "window"
+    # 总帧数 ≈ 6000+2+200，1% ≈ 62 帧：最慢的 5 FPS 段只占 2 帧，轮不到它
+    assert result["fps_1pct_low"] == 40.0
+
+
+def test_summarize_1pct_low_prefers_real_frame_intervals():
+    samples = [
+        {"fps": 60.0, "frames": 60, "fps_1pct": 50.0},
+        {"fps": 55.0, "frames": 55, "fps_1pct": 30.0},
+    ]
+    result = fps.summarize(samples)
+    assert result["fps_1pct_source"] == "frame"
+    assert result["fps_1pct_low"] == 30.0
 
 
 def test_summarize_reports_1pct_low_and_processes():
@@ -214,3 +281,27 @@ def test_report_renders_fps_panel(tmp_path):
     # 内嵌的 plotly.js 源码里本来就有 cdn.plot.ly 这个默认配置字符串，
     # 所以判据是「没有外部 script/link 引用」，不是字符串不出现。
     assert not re.search(r"<script[^>]+src=", html)
+
+
+def test_report_fps_curve_tolerates_samples_without_fps(tmp_path):
+    """复现 1113 现场：重复投递导致一半样本算不出帧率，曲线必须照画。"""
+    from mac_thermal_lab.analysis import load_session
+    from mac_thermal_lab.report import build_figure
+
+    paths = _fps_session(tmp_path)
+    interleaved = []
+    for line in paths.fps_samples.read_text(encoding="utf-8").splitlines():
+        interleaved.append(line)
+        blank = json.loads(line)
+        blank["fps"] = None
+        blank["fps_1pct"] = None
+        interleaved.append(json.dumps(blank))
+    paths.fps_samples.write_text("\n".join(interleaved) + "\n", encoding="utf-8")
+
+    data = load_session(paths)
+    fig = build_figure(data)
+    curve = next(trace for trace in fig.data if trace.name == "帧率 (FPS)")
+    ys = list(curve.y)
+    assert len(ys) == 5
+    assert all(value is not None for value in ys)
+    assert curve.connectgaps is True
