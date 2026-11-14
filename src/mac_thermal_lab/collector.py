@@ -160,6 +160,8 @@ class Collector:
         self.thermal_error: str | None = None
         self.game_error: str | None = None
         self._game_process: str | None = None
+        self._hud_status: dict[str, Any] = {}
+        self._hud_adoption_noted = False
         self._soc_captured = False
         self._stop_reason = "unknown"
         self._current_macmon: subprocess.Popen | None = None
@@ -298,7 +300,7 @@ class Collector:
             self._record_error("未找到 /usr/bin/log，无法读取 Metal HUD 的帧率日志")
             self._mark_game_error("系统缺少 log 命令")
             return None
-        cmd = fps_mod.build_log_stream_command(self.game_filter)
+        cmd = fps_mod.build_log_stream_command()
         self.logger.log(f"启动 HUD 帧率采集：{' '.join(cmd)}")
         proc = self._popen(cmd, name="hud")
         if proc is None:
@@ -319,6 +321,41 @@ class Collector:
             write_json(self.paths.metadata, meta)
         except OSError:
             pass
+
+    @staticmethod
+    def _merge_game_notes(game: dict[str, Any], status: dict[str, Any]) -> None:
+        """把「谁在写 HUD / 过滤词有没有落空」记进 metadata。"""
+        if status.get("seen"):
+            game["hud_seen_processes"] = dict(status["seen"])
+        if status.get("adopted_from"):
+            game["filter_fallback"] = {
+                "requested": status["adopted_from"],
+                "used": status.get("filter"),
+            }
+            game["process"] = status.get("filter")
+
+    def _sync_hud_status(self) -> None:
+        """同步解析器现场信息；一旦自动改用了别的进程，立刻落进 metadata。
+
+        这条记录是「--game 过滤词打错」唯一能留下的证据，41 分钟白录过一次。
+        """
+        status = self._hud_parser.status()
+        self._hud_status = status
+        if not status.get("adopted_from") or self._hud_adoption_noted:
+            return
+        self._hud_adoption_noted = True
+        self.logger.log(
+            f"过滤词 {status['adopted_from']!r} 未匹配到任何 HUD 进程，"
+            f"已自动改用 {status.get('filter')!r}"
+        )
+        meta = read_json(self.paths.metadata) or {}
+        game = meta.get("game")
+        if isinstance(game, dict):
+            self._merge_game_notes(game, status)
+            try:
+                write_json(self.paths.metadata, meta)
+            except OSError:
+                pass
 
     def _capture_game_process(self, process: str | None) -> None:
         """记下第一个出现 HUD 的进程名，报告里用来标注是哪款游戏。"""
@@ -364,6 +401,7 @@ class Collector:
                 if not isinstance(record, dict):
                     continue
                 sample = self._hud_parser.feed(record)
+                self._sync_hud_status()
                 if sample is None:
                     continue
                 try:
@@ -621,6 +659,7 @@ class Collector:
                 "thermal_enabled": self.thermal_enabled,
                 "game_enabled": self.game_enabled,
                 "game_process": self._game_process,
+                "hud": dict(self._hud_status),
                 "counts": dict(self.counts),
                 "last_sample_at": dict(self.last_sample_at),
                 "children": {k: dict(v) for k, v in self.children.items()},
@@ -666,6 +705,10 @@ class Collector:
         meta["status"] = "stopped" if self._stop_reason != "unknown" else "aborted"
         meta["stop_reason"] = self._stop_reason
         meta["counts"] = dict(self.counts)
+        if self.game_enabled:
+            game = meta.get("game")
+            if isinstance(game, dict):
+                self._merge_game_notes(game, self._hud_status or self._hud_parser.status())
         if self.errors:
             existing = meta.get("errors") or []
             meta["errors"] = list(dict.fromkeys([*existing, *self.errors]))

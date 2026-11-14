@@ -79,6 +79,7 @@ mtl report --open           # 重新生成最近一次实验的报告并打开
 | `mtl status [会话]` | 采集状态、时长、样本数、子进程、已落盘大小 |
 | `mtl mark "事件" -n 备注` | 在当前实验时间轴加事件 |
 | `mtl report [会话] [--open]` | 重新生成 HTML 报告 |
+| `mtl recover-fps [会话] [--process 名] [--force]` | 从系统日志历史补回帧率（过滤词写错时救场） |
 | `mtl list` | 列出历史实验 |
 | `mtl doctor [--thermal] [--game]` | 环境自检；`--thermal` 实跑 powermetrics，`--game` 实测帧率链路 |
 | `mtl paths [--init-config]` | 显示 XDG 目录布局；`--init-config` 写配置模板 |
@@ -224,9 +225,13 @@ mtl migrate             # 执行
 再把系统日志里的逐秒帧率抓下来，和温度/功耗放到同一根时间轴上。
 
 ```bash
-mtl start 王国之泪 --game          # 自动识别是哪个进程
-mtl start 王国之泪 --game Ryujinx  # 指定进程名（子串匹配）
+mtl start 王国之泪 --game                  # 自动识别是哪个进程
+mtl start 王国之泪 --game OcarinaOfTime    # 指定进程名（子串匹配，忽略大小写/空格/标点）
 ```
+
+`--game` 的值只是**过滤词**，不是系统日志的硬条件：匹配在程序里做，写错了也
+还能看到「其实有别的进程在写 HUD」，并且攒够 3 行就会自动改用那个进程，
+metadata 里记为 `filter_fallback`，`mtl stop` 和报告都会写明白。
 
 原理：Apple 的 HUD 在 `MTL_HUD_ENABLED=1` 时显示浮层，再加上
 `MTL_HUD_LOG_ENABLED=1` 后，每秒往统一日志写一行
@@ -246,6 +251,9 @@ metal-HUD: 首帧号,预计丢帧,进程内存MB,逐帧(间隔ms,GPU时间ms)…
 - `log stream` 会把同一条记录投递**两份**（一份 `subsystem` 为空、一份
   `com.apple.metal.hud`）。解析器按帧号去重，否则每秒会多一条算不出帧率的空记录，
   报告里的折线会被空值切成碎片、一条线都看不见。
+- 早期版本把 `--game` 的词拼进日志谓词（`processImagePath CONTAINS "ott"`），
+  词写错就是**一行都收不到**，而且看不出为什么——1114 那次 41 分钟的录制
+  就这样白跑了。现在谓词只筛 `metal-HUD`，进程过滤回到解析器。
 
 ### 三条必须遵守的使用条件
 
@@ -263,8 +271,16 @@ mtl doctor --game      # 实测一次：开关环境变量 → log stream 3s →
 ```
 
 - 输出「没有捕获到 metal-HUD 日志行」且此刻没有游戏在跑，是正常结果。
-- 报告里帧率面板会直接写明原因（没开 `--game` / 环境变量设不上 / 没抓到 HUD 行）。
+- 报告里帧率面板会直接写明原因（没开 `--game` / 环境变量设不上 / 没抓到 HUD 行 /
+  收到了 HUD 但与过滤词不符，并列出实际进程名）。
+- `mtl status` 会实时给出「谁在写 HUD」：过滤词一条都没匹配上时立刻告诉你实际进程名。
 - 原始 `log stream` 输出都在 `hud.log`，可以自己翻。
+- 已经录完才发现帧率是空的？系统日志还留着那段时间的 HUD 行，可以补回来
+  （受系统日志保留期限制，越早越好）：
+
+```bash
+mtl recover-fps 2026-11-14_190552 --process OcarinaOfTime
+```
 
 > **实测情况**：已在《塞尔达传说 王国之泪》（`totk-native`）上跑通 17 分钟，
 > 抓到 1564 条帧率样本（约 59.7 FPS 平均）。解析逻辑另有合成样本测试覆盖

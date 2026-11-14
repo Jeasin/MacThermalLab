@@ -144,10 +144,32 @@ def _fps_missing_text(data: SessionData) -> str:
             f"<span style='font-size:11px'>{html_mod.escape(str(error))}</span><br>"
             "<span style='font-size:11px'>可用 <code>mtl doctor --game</code> 单独验证</span>"
         )
+    seen = game.get("hud_seen_processes") or {}
+    if seen:
+        ordered = sorted(seen.items(), key=lambda item: item[1], reverse=True)
+        listing = "、".join(
+            f"{html_mod.escape(name)}（{count} 行）" for name, count in ordered[:3]
+        )
+        requested = (game.get("filter_fallback") or {}).get("requested") or game.get("filter")
+        return (
+            "<b>有进程在写 Metal HUD，但没有一条符合过滤条件</b><br>"
+            f"<span style='font-size:11px'>过滤词「{html_mod.escape(str(requested))}」，"
+            f"实际在写的是 {listing}</span><br>"
+            "<span style='font-size:11px'>下次直接用进程名："
+            f"<code>mtl start 名称 --game {html_mod.escape(ordered[0][0])}</code></span>"
+        )
+    requested = game.get("filter")
+    filter_text = (
+        f"<br><span style='font-size:11px'>本次的过滤词是「{html_mod.escape(str(requested))}」，"
+        "一条日志都没收到——词写错时就是这个现象</span>"
+        if requested
+        else ""
+    )
     return (
         "<b>没有捕获到 Metal HUD 的帧率数据</b><br>"
         "<span style='font-size:11px'>HUD 只对 Metal 呈现的应用生效，且游戏必须在设置环境变量<b>之后</b>启动；"
         "菜单界面等场景也可能不产生日志。原始的 log stream 输出见 hud.log</span>"
+        f"{filter_text}"
     )
 
 

@@ -103,6 +103,15 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _describe_counts(counts: dict[str, Any], limit: int = 4) -> str:
+    """把 {"进程": 行数} 排成一行可读文本，多的时候只列前几个。"""
+    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    shown = "、".join(f"{name}（{count} 行）" for name, count in ordered[:limit])
+    if len(ordered) > limit:
+        shown += f" 等 {len(ordered)} 个"
+    return shown or "-"
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -398,7 +407,10 @@ def cmd_start(args) -> int:
         else:
             label = game_filter or "自动识别"
             print(f"  帧率      Metal HUD 已开启（{label}）")
-            print(f"            {c('现在启动游戏即可；HUD 每秒写一行到系统日志', C_DIM)}")
+            if game_filter:
+                print(f"            {c('过滤词按进程名/路径匹配（大小写与空格不敏感）；一条都对不上时会自动改用真正在写 HUD 的进程', C_DIM)}")
+            else:
+                print(f"            {c('现在启动游戏即可；HUD 每秒写一行到系统日志', C_DIM)}")
     else:
         print(c("  帧率      未采集（加 --game 可记录）", C_DIM))
     print()
@@ -569,11 +581,20 @@ def cmd_stop(args) -> int:
             print(f"  原因：{thermal_meta['error']}")
         print(f"  排查：{c('mtl doctor --thermal', C_BOLD)}")
     game_meta = (read_json(session.metadata) or {}).get("game") or {}
+    fallback = game_meta.get("filter_fallback") or {}
+    if fallback:
+        used = str(fallback.get("used"))
+        print()
+        print(warn(f"--game 过滤词「{fallback.get('requested')}」没有匹配到任何 HUD 进程"))
+        print(f"  已自动改用 {c(used, C_BOLD)}，下次直接写 {c('--game ' + used, C_BOLD)} 更省事")
     if game_meta.get("enabled") and smy["raw_counts"].get("fps_samples", 0) == 0:
         print()
         print(warn("本次启用了帧率采集，但没有捕获到 Metal HUD 数据"))
+        seen = game_meta.get("hud_seen_processes") or {}
         if game_meta.get("error"):
             print(f"  原因：{game_meta['error']}")
+        elif seen:
+            print(f"  记录期间有进程在写 HUD，但都被过滤词挡掉了：{_describe_counts(seen)}")
         else:
             print("  常见原因：游戏在设置环境变量之前就启动了；或该游戏不走 Metal 呈现")
         print(f"  排查：{c('mtl doctor --game', C_BOLD)}")
@@ -694,13 +715,27 @@ def cmd_status(args) -> int:
         print(warn(f"Thermal 采集异常：{thermal_meta['error']}"))
 
     game_meta = meta.get("game") or {}
+    hud_state = state.get("hud") or {}
     if game_meta.get("enabled"):
         if game_meta.get("error"):
             print(warn(f"帧率采集异常：{game_meta['error']}"))
         elif game_meta.get("process"):
             print(f"  HUD 进程  {game_meta['process']}")
+            if (hud_state.get("adopted_from") or (game_meta.get("filter_fallback") or {})):
+                requested = (hud_state.get("adopted_from")
+                             or (game_meta.get("filter_fallback") or {}).get("requested"))
+                print(f"            {c(f'过滤词「{requested}」没匹配到，已自动改用该进程', C_DIM)}")
         elif counts.get("fps_samples", 0) == 0:
-            print(warn("帧率采集已开启，但还没有收到 Metal HUD 日志（游戏启动了吗？）"))
+            seen = hud_state.get("seen") or {}
+            if seen:
+                print(warn("收到 Metal HUD 日志，但没有一行匹配过滤词"
+                           f"「{hud_state.get('requested_filter')}」"))
+                print(f"  实际在写 HUD：{_describe_counts(seen)}")
+                print(f"  已自动改用 {c(str(hud_state.get('filter')), C_BOLD)}，等它出第一条样本"
+                      if hud_state.get("adopted_from")
+                      else f"  建议：{c('mtl stop', C_BOLD)} 后用 --game <上面的进程名> 重来")
+            else:
+                print(warn("帧率采集已开启，但还没有收到 Metal HUD 日志（游戏启动了吗？）"))
 
     errors = state.get("errors") or []
     if errors:
@@ -904,8 +939,13 @@ def cmd_doctor(args) -> int:
             print(ok(f"解析到 {hud['sample_count']} 条帧率样本"))
         else:
             print(warn("没有捕获到 metal-HUD 日志行"))
-            print(c("  如果此刻没有游戏在跑，这是正常的。", C_DIM))
-            print(c("  先 mtl start 名称 --game，再启动游戏，然后重跑本命令。", C_DIM))
+            seen = (hud.get("status") or {}).get("seen") or {}
+            if seen:
+                print(f"  收到过 HUD 行的进程：{_describe_counts(seen)}")
+                print(c("  有 HUD 但算不出帧率，通常是只有一帧或帧号没变", C_DIM))
+            else:
+                print(c("  如果此刻没有游戏在跑，这是正常的。", C_DIM))
+                print(c("  先 mtl start 名称 --game，再启动游戏，然后重跑本命令。", C_DIM))
         if hud.get("stderr"):
             print(c("  log stream: " + hud["stderr"], C_DIM))
     return 0
@@ -941,6 +981,88 @@ def cmd_paths(args) -> int:
             print(f"  执行 {c('mtl migrate', C_BOLD)} 迁移，或用 "
                   f"{c('mtl migrate --dry-run', C_BOLD)} 先看会做什么")
     return 0
+
+
+def cmd_recover_fps(args) -> int:
+    """从系统日志历史里补回某场实验的帧率（录制时过滤词写错的救援通道）。"""
+    paths = _app_paths(args)
+    try:
+        session = resolve_session_multi(_records_roots(paths), args.session)
+    except LookupError as exc:
+        print(err(str(exc)))
+        return 1
+
+    meta = read_json(session.metadata) or {}
+    started = parse_timestamp(meta.get("started_at"))
+    ended = parse_timestamp(meta.get("ended_at")) or utc_now()
+    if started is None:
+        print(err("metadata 里没有 started_at，无法确定要从哪段时间捞日志"))
+        return 1
+
+    game = meta.get("game") or {}
+    process = (args.process or game.get("process") or game.get("filter") or "").strip() or None
+
+    existing = 0
+    if session.fps_samples.exists():
+        existing = sum(1 for line in session.fps_samples.read_text(encoding="utf-8").splitlines() if line.strip())
+    if existing and not args.force:
+        print(err(f"该实验已有 {existing} 条帧率样本；确实要覆盖就加 --force"))
+        return 1
+
+    print(heading("从系统日志补回帧率"))
+    print(f"  会话      {session.name}")
+    print(f"  时间窗    {fmt_local(started, '%Y-%m-%d %H:%M:%S')} → "
+          f"{fmt_local(ended, '%Y-%m-%d %H:%M:%S')}")
+    print(f"  过滤词    {process or '自动识别'}")
+    print(c("  正在翻 log show 历史，40 分钟的窗口通常要几秒到十几秒……", C_DIM))
+
+    result = fps_mod.recover_from_log(started, ended, process)
+    if result["error"]:
+        print(err(result["error"]))
+        return 1
+    samples = result["samples"]
+    status = result.get("status") or {}
+    if not samples:
+        print(warn(f"这段时间里没有解析出帧率样本（读到 {result['raw_lines']} 行日志）"))
+        seen = status.get("seen") or {}
+        if seen:
+            print(f"  有 HUD 日志的进程：{_describe_counts(seen)}")
+        else:
+            print(c("  系统日志只保留有限天数；当时没开 HUD 日志、或游戏不在 Metal 上呈现，也会是空的", C_DIM))
+        return 1
+
+    session.fps_samples.write_text(
+        "".join(json.dumps(sample, ensure_ascii=False) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    if status.get("adopted_from"):
+        process = status.get("filter")
+        game["filter_fallback"] = {
+            "requested": status.get("requested_filter"),
+            "used": status.get("filter"),
+        }
+    game["process"] = process or game.get("process")
+    game["hud_seen_processes"] = dict(status.get("seen") or {})
+    game["recovered_from_log"] = {
+        "samples": len(samples),
+        "raw_lines": result["raw_lines"],
+    }
+    meta["game"] = game
+    write_json(session.metadata, meta)
+
+    fps_summary = fps_mod.summarize(samples)
+    print(ok(f"补回 {len(samples)} 条帧率样本"
+             f"（{fps_summary.get('processes') and '、'.join(fps_summary['processes'])}）"))
+    print(f"  平均 {_fmt_num(fps_summary.get('fps_avg'), 1)} FPS · "
+          f"1% low ≈ {_fmt_num(fps_summary.get('fps_1pct_low'), 1)} · "
+          f"最低 {_fmt_num(fps_summary.get('fps_min'), 1)}")
+    path = generate_report(session)
+    print(ok(f"报告已重新生成：{path}"))
+    return 0
+
+
+def _fmt_num(value: Any, digits: int) -> str:
+    return "-" if value is None else f"{float(value):.{digits}f}"
 
 
 def cmd_migrate(args) -> int:
@@ -1014,6 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
 记帧率:
   mtl start 名称 --game      同时记录游戏 FPS（Metal HUD）
   mtl doctor --game          实测帧率采集链路
+  mtl recover-fps 会话       从系统日志历史补回帧率（过滤词写错时救场）
 
 数据位置:
   mtl paths                查看配置/数据/状态目录（XDG）
@@ -1059,6 +1182,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session", nargs="?", help="实验目录名（默认最近一次）")
     p.add_argument("--open", action="store_true", help="生成后自动打开")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("recover-fps", help="从系统日志历史里补回某场实验的帧率")
+    p.add_argument("session", nargs="?", help="实验目录名（默认最近一次）")
+    p.add_argument("--process", help="HUD 进程名；默认用 metadata 里记录的")
+    p.add_argument("--force", action="store_true", help="已有帧率样本时也覆盖")
+    p.set_defaults(func=cmd_recover_fps)
 
     p = sub.add_parser("list", help="列出历史实验")
     p.set_defaults(func=cmd_list)

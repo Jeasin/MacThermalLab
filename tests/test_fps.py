@@ -94,6 +94,56 @@ def test_stream_parser_process_filter():
     assert parser.feed(_record(message, ts, process="Ryujinx")) is not None
 
 
+def test_stream_parser_filter_ignores_case_space_and_punctuation():
+    """--game "Ocarina of Time" 要能对上进程名 OcarinaOfTime。"""
+    parser = fps.HudStreamParser("Ocarina of Time")
+    ts = datetime(2026, 11, 13, 14, 0, 0, tzinfo=timezone.utc)
+    parser.feed(_record("metal-HUD: 100,0,10.0", ts, process="OcarinaOfTime"))
+    sample = parser.feed(
+        _record("metal-HUD: 160,0,10.0", ts + timedelta(seconds=1), process="OcarinaOfTime")
+    )
+    assert sample is not None and sample["fps"] == pytest.approx(60.0, abs=0.1)
+
+
+def test_stream_parser_adopts_real_process_when_filter_never_matches():
+    """1114 现场：--game ott 对不上 OcarinaOfTime，一条数据都收不到。
+
+    进程过滤已经不在内核谓词里，所以能看见「其实有进程在写 HUD」，
+    攒够 3 行就自动改用那个进程，别让整场白录。
+    """
+    parser = fps.HudStreamParser("ott")
+    t0 = datetime(2026, 11, 14, 19, 10, 0, tzinfo=timezone.utc)
+    samples = [
+        parser.feed(
+            _record(
+                f"metal-HUD: {1000 + index * 30},0,120.0",
+                t0 + timedelta(seconds=index * 0.5),
+                process="OcarinaOfTime",
+            )
+        )
+        for index in range(6)
+    ]
+    status = parser.status()
+    assert status["seen"] == {"OcarinaOfTime": 6}
+    assert status["rejected"] == {"OcarinaOfTime": 3}   # 前 3 行被挡，第 3 行后改用
+    assert status["adopted_from"] == "ott"
+    assert status["filter"] == "OcarinaOfTime"
+    # 第 3 行开始收下；它是新的基线，算不出帧率，所以从第 4 行起才有样本
+    assert [s is not None for s in samples] == [False, False, False, True, True, True]
+    assert samples[-1]["fps"] == pytest.approx(60.0, abs=0.5)
+
+
+def test_stream_parser_requires_three_lines_before_adopting():
+    """HUD 环境变量是全局的，别让别的应用几十毫秒就把「游戏」身份抢走。"""
+    parser = fps.HudStreamParser("ott")
+    t0 = datetime(2026, 11, 14, 19, 10, 0, tzinfo=timezone.utc)
+    for index in range(2):
+        parser.feed(_record(f"metal-HUD: {index},0,10.0",
+                            t0 + timedelta(seconds=index), process="Safari"))
+    assert parser.status()["adopted_from"] is None
+    assert parser.status()["seen"] == {"Safari": 2}
+
+
 def test_stream_parser_drops_duplicate_log_delivery():
     """同一条 HUD 记录会被 log stream 投递两份，帧号相同——不能变成两条样本。
 
@@ -181,10 +231,11 @@ def test_build_log_stream_command_uses_absolute_log_and_ndjson():
     cmd = fps.build_log_stream_command()
     assert cmd[0] == "/usr/bin/log"
     assert "--style" in cmd and "ndjson" in cmd
-    filtered = fps.build_log_stream_command("Ryujinx")
-    predicate = filtered[filtered.index("--predicate") + 1]
+    predicate = cmd[cmd.index("--predicate") + 1]
     assert "metal-HUD" in predicate
-    assert "Ryujinx" in predicate
+    # 进程名不再进谓词：谓词是内核硬过滤，词写错就连「其实有 HUD」都看不见
+    assert "processImagePath" not in predicate
+    assert "Ryujinx" not in predicate
 
 
 def test_specimen_line_from_jsonl_roundtrip(tmp_path):
@@ -281,6 +332,103 @@ def test_report_renders_fps_panel(tmp_path):
     # 内嵌的 plotly.js 源码里本来就有 cdn.plot.ly 这个默认配置字符串，
     # 所以判据是「没有外部 script/link 引用」，不是字符串不出现。
     assert not re.search(r"<script[^>]+src=", html)
+
+
+def test_merge_game_notes_records_fallback():
+    """自动改用进程这件事必须落进 metadata，否则事后无从解释。"""
+    from mac_thermal_lab.collector import Collector
+
+    game: dict = {"enabled": True}
+    Collector._merge_game_notes(
+        game,
+        {
+            "seen": {"OcarinaOfTime": 5},
+            "rejected": {"OcarinaOfTime": 3},
+            "adopted_from": "ott",
+            "filter": "OcarinaOfTime",
+        },
+    )
+    assert game["filter_fallback"] == {"requested": "ott", "used": "OcarinaOfTime"}
+    assert game["hud_seen_processes"] == {"OcarinaOfTime": 5}
+    assert game["process"] == "OcarinaOfTime"
+
+
+def test_recover_from_log_parses_history(monkeypatch):
+    """log show 的历史行和 log stream 同格式，补录走同一条解析路径。"""
+    from mac_thermal_lab import fps
+
+    t0 = datetime(2026, 11, 14, 19, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    lines = [
+        json.dumps(_record(f"metal-HUD: {100 + index * 30},0,10.0",
+                           t0 + timedelta(seconds=index * 0.5), process="OcarinaOfTime"))
+        for index in range(4)
+    ]
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "\n".join(lines)
+        stderr = ""
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeCompleted()
+
+    monkeypatch.setattr(fps.subprocess, "run", fake_run)
+    result = fps.recover_from_log(t0, t0 + timedelta(minutes=1), "Ocarina of Time")
+
+    assert result["error"] is None
+    assert result["raw_lines"] == 4
+    assert [round(s["fps"], 1) for s in result["samples"]] == [60.0, 60.0, 60.0]
+    assert result["status"]["adopted_from"] is None      # 归一化后直接命中
+    assert "show" in captured["cmd"] and "--start" in captured["cmd"]
+
+
+def test_recover_from_log_reports_unmatched_filter(monkeypatch):
+    from mac_thermal_lab import fps
+
+    t0 = datetime(2026, 11, 14, 19, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    lines = [
+        json.dumps(_record(f"metal-HUD: {100 + index * 30},0,10.0",
+                           t0 + timedelta(seconds=index * 0.5), process="OcarinaOfTime"))
+        for index in range(3)
+    ]
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "\n".join(lines)
+        stderr = ""
+
+    monkeypatch.setattr(fps.subprocess, "run", lambda *a, **k: FakeCompleted())
+    result = fps.recover_from_log(t0, t0 + timedelta(minutes=1), "ott")
+    assert result["status"]["seen"] == {"OcarinaOfTime": 3}
+    assert result["status"]["adopted_from"] == "ott"
+
+
+def test_report_explains_filter_mismatch(tmp_path):
+    """1114 现场：收到的 HUD 都被过滤词挡掉了，画布上要把真实进程名说出来。"""
+    from mac_thermal_lab.analysis import load_session
+    from mac_thermal_lab.report import build_figure
+    from mac_thermal_lab.storage import read_json, write_json
+
+    paths = _fps_session(tmp_path)
+    paths.fps_samples.write_text("", encoding="utf-8")
+    meta = read_json(paths.metadata)
+    meta["game"] = {
+        "enabled": True,
+        "filter": "ott",
+        "process": None,
+        "error": None,
+        "hud_seen_processes": {"OcarinaOfTime": 420},
+    }
+    write_json(paths.metadata, meta)
+
+    fig = build_figure(load_session(paths))
+    text = " ".join(ann.text for ann in fig.layout.annotations if ann.text)
+    assert "有进程在写 Metal HUD" in text
+    assert "OcarinaOfTime（420 行）" in text
+    assert "--game OcarinaOfTime" in text
 
 
 def test_report_fps_curve_tolerates_samples_without_fps(tmp_path):

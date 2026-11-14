@@ -109,17 +109,15 @@ def hud_env_snapshot() -> dict[str, str | None]:
 # --------------------------------------------------------------------------- #
 # 命令行
 # --------------------------------------------------------------------------- #
-def build_log_stream_command(process_name: str | None = None) -> list[str]:
+def build_log_stream_command() -> list[str]:
     """构造 log stream 命令。
 
     用 ndjson 而不是默认的文本格式：字段能直接取，不必猜分隔符。
-    谓词只筛 HUD 行；进程过滤在解析阶段做（日志里的进程字段比谓词可靠）。
+    谓词**只**筛 HUD 行，不再把进程名塞进去：谓词是系统内核层的硬过滤，
+    词写错（比如 --game ott 对上 OcarinaOfTime）就一行都收不到，
+    连「其实收到了别的进程的 HUD」都无从得知。进程选择改由解析器做。
     """
     predicate = f'eventMessage CONTAINS "{HUD_LOG_KEY}"'
-    if process_name:
-        # 进程名放进谓词可以让内核层就过滤掉其它应用的 HUD
-        escaped = process_name.replace('"', '\\"')
-        predicate += f' AND processImagePath CONTAINS "{escaped}"'
     return [LOG_BIN, "stream", "--style", "ndjson", "--predicate", predicate]
 
 
@@ -225,37 +223,84 @@ def _process_name(record: dict) -> str | None:
     return str(name) if name else None
 
 
+ADOPT_MIN_LINES = 3
+"""过滤词一条都对不上时，同一个进程要累计多少行 HUD 才敢改用它。
+
+设个门槛是因为 HUD 的环境变量是全局的：录制期间其它 GUI 应用也可能
+顺手往日志里写几行，不能让它们抢走「游戏」的身份。
+"""
+
+
+def _norm(text: str | None) -> str:
+    """归一化后再比：忽略大小写、空格和标点。
+
+    这样 ``--game "Ocarina of Time"`` 能对上进程名 ``OcarinaOfTime``。
+    """
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
 class HudStreamParser:
     """把 log stream 的 ndjson 行转成帧率样本。"""
 
     def __init__(self, process_filter: str | None = None) -> None:
-        self.process_filter = (process_filter or "").strip().lower() or None
+        self.process_filter = (process_filter or "").strip() or None
+        self.requested_filter = self.process_filter   # 用户原话，报告里要回显
+        self.adopted_from: str | None = None          # 自动改用时的原过滤词
+        self._filter_norm = _norm(self.process_filter) or None
         self._last_frame: float | None = None
         self._last_ts: datetime | None = None
-        self.seen_processes: dict[str, int] = {}
+        self._accepted = 0
+        self.seen_processes: dict[str, int] = {}      # 所有写过 HUD 的进程
+        self.rejected_processes: dict[str, int] = {}  # 被过滤词挡掉的那些
 
     def _matches(self, record: dict, process: str | None) -> bool:
-        if not self.process_filter:
+        if not self._filter_norm:
             return True
-        haystacks = [
-            (process or "").lower(),
-            str(record.get("processImagePath") or "").lower(),
-        ]
-        return any(self.process_filter in item for item in haystacks)
+        haystacks = [_norm(process), _norm(str(record.get("processImagePath") or ""))]
+        return any(self._filter_norm in item for item in haystacks if item)
+
+    def _maybe_adopt(self, process: str | None) -> None:
+        """过滤词谁也对不上时，改用真正在写 HUD 的进程，别让整场白录。
+
+        只在「一条都还没接受过」时触发，且要同一进程攒够 ADOPT_MIN_LINES 行。
+        """
+        if not process or self._filter_norm is None or self._accepted or self.adopted_from:
+            return
+        if self.rejected_processes.get(process, 0) < ADOPT_MIN_LINES:
+            return
+        self.adopted_from = self.process_filter
+        self.process_filter = process
+        self._filter_norm = _norm(process)
+
+    def status(self) -> dict:
+        """给 CLI / 元数据用的现场信息：谁在写 HUD、过滤词有没有落空。"""
+        return {
+            "requested_filter": self.requested_filter,
+            "filter": self.process_filter,
+            "adopted_from": self.adopted_from,
+            "seen": dict(self.seen_processes),
+            "rejected": dict(self.rejected_processes),
+            "accepted": self._accepted,
+        }
 
     def feed(self, record: dict) -> dict | None:
         parsed = parse_hud_message(record.get("eventMessage"))
         if parsed is None:
             return None
         process = _process_name(record)
+        if process:
+            self.seen_processes[process] = self.seen_processes.get(process, 0) + 1
         if not self._matches(record, process):
-            return None
+            if process:
+                self.rejected_processes[process] = (
+                    self.rejected_processes.get(process, 0) + 1
+                )
+            self._maybe_adopt(process)
+            if not self._matches(record, process):
+                return None
         ts = parse_log_timestamp(record.get("timestamp"))
         if ts is None:
             return None
-
-        if process:
-            self.seen_processes[process] = self.seen_processes.get(process, 0) + 1
 
         # 帧号差分是主口径：两行之间涨了多少帧，就是这段时间的帧数。
         # 同一条 HUD 记录会被 log stream 投递两次（一份 subsystem 为空、
@@ -294,6 +339,7 @@ class HudStreamParser:
         if interval_ms is None and window_s and counted_frames:
             interval_ms = window_s * 1000.0 / counted_frames
 
+        self._accepted += 1
         return {
             "timestamp": iso_utc(ts),
             "process": process,
@@ -357,6 +403,59 @@ def _weighted_low(samples: list[dict], share: float = 0.01) -> float | None:
     return min(fps for fps, _ in weighted)
 
 
+def recover_from_log(
+    start: datetime, end: datetime, process_filter: str | None = None, timeout: float = 300.0
+) -> dict:
+    """从统一日志的历史里补回帧率。
+
+    `log stream` 只能读实时流；已经过去的 HUD 行要用 `log show` 翻历史。
+    录制时过滤词写错、事后才发现的场景靠这个救回来（受系统日志保留期限制）。
+    """
+    cmd = [
+        LOG_BIN,
+        "show",
+        "--start", start.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+        "--end", end.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+        "--style", "ndjson",
+        "--predicate", f'eventMessage CONTAINS "{HUD_LOG_KEY}"',
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"samples": [], "status": {}, "raw_lines": 0, "command": cmd,
+                "error": f"无法读取系统日志历史：{exc}"}
+
+    parser = HudStreamParser(process_filter)
+    samples: list[dict] = []
+    raw_lines = 0
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        raw_lines += 1
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        sample = parser.feed(record)
+        if sample is not None:
+            samples.append(sample)
+    error = None
+    if completed.returncode not in (0, 1):     # log show 没匹配到时会返回 1
+        error = (completed.stderr or "").strip()[-300:] or f"log show 退出码 {completed.returncode}"
+    return {
+        "samples": samples,
+        "status": parser.status(),
+        "raw_lines": raw_lines,
+        "command": cmd,
+        "error": error,
+    }
+
+
 def summarize(samples: list[dict]) -> dict:
     """汇总帧率。
 
@@ -411,7 +510,7 @@ def hud_selftest(seconds: float = 3.0, process_name: str | None = None) -> dict:
         "stderr": "",
     }
 
-    cmd = build_log_stream_command(process_name)
+    cmd = build_log_stream_command()
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -457,6 +556,7 @@ def hud_selftest(seconds: float = 3.0, process_name: str | None = None) -> dict:
             samples.append(sample)
     result["samples"] = samples[:5]
     result["sample_count"] = len(samples)
+    result["status"] = parser.status()
     stderr_text = (err or "").strip()
     if stderr_text:
         result["stderr"] = stderr_text[-400:]
