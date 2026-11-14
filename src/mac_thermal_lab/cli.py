@@ -762,7 +762,9 @@ def cmd_mark(args) -> int:
         print(err("当前没有正在进行的实验，先执行 mtl start"))
         return 1
     started = parse_timestamp((read_json(session.metadata) or {}).get("started_at"))
-    event = append_event(session.events, args.event, args.note or "", started)
+    # nargs="+" 收到的是词表，直接拼回一句话：mtl mark 风扇 开到最大 也不用引号
+    label = " ".join(args.event).strip()
+    event = append_event(session.events, label, args.note or "", started)
     elapsed = fmt_duration(event.elapsed_seconds)
     print(ok(f"已标记「{event.event}」 @ {fmt_local(event.ts, '%H:%M:%S')}（+{elapsed}）"))
     return 0
@@ -817,10 +819,21 @@ def cmd_list(args) -> int:
         label = status
         if session.name not in current_names and session.name in legacy_names:
             label = f"{status} {c('(旧目录)', C_DIM)}"
+        # start 没写名称时，name 就是时间戳本身，再列一遍没有信息量；
+        # 这时把 HUD 进程填进「游戏」列，那场实验才认得出是哪次。
+        display = meta.get("name") or ""
+        if not display or display == session.name:
+            display = "-"
+        game_meta = meta.get("game") or {}
+        game = game_meta.get("process")
+        if not game:
+            seen = game_meta.get("hud_seen_processes") or {}
+            game = next(iter(sorted(seen, key=seen.get, reverse=True)), None)
         rows.append(
             [
                 session.name,
-                (meta.get("name") or "-")[:24],
+                display[:24],
+                (game or "-")[:22],
                 fmt_local(started, "%m-%d %H:%M"),
                 fmt_duration(span),
                 str(counts.get("macmon_samples", "-")),
@@ -830,7 +843,7 @@ def cmd_list(args) -> int:
         )
 
     print(_table(
-        ["会话", "名称", "开始", "时长", "macmon", "thermal", "状态"], rows
+        ["会话", "名称", "游戏", "开始", "时长", "macmon", "thermal", "状态"], rows
     ))
     print()
     print(f"数据目录：{paths.recordings_dir}")
@@ -1152,14 +1165,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("start", help="开始新实验并启动采集")
-    p.add_argument("name", nargs="?", help="实验名称（默认用时间戳）")
+    p.add_argument("name", nargs="?", help="实验名称（= 目录名后缀，如 oot；留空则只有时间戳）")
     p.add_argument("-i", "--interval", default="2000",
                    help="采样间隔，默认 2000（毫秒），也可写 2s / 500ms")
     p.add_argument("--no-thermal", action="store_true", help="不采集 Thermal Pressure（免 sudo）")
     p.add_argument("--no-soc-info", action="store_true", help="不在每行附带 SoC 信息")
     p.add_argument(
         "--game", nargs="?", const="", default=None, metavar="进程名",
-        help="记录游戏帧率（Metal HUD）。可留空自动识别，或指定进程名，如 --game Ryujinx",
+        help="记录游戏帧率（Metal HUD）。留空自动识别；也可指定进程名（不是实验名），"
+             "如 --game OcarinaOfTime",
     )
     p.set_defaults(func=cmd_start)
 
@@ -1174,8 +1188,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("mark", help="在时间轴上添加事件")
-    p.add_argument("event", help="事件名，例如 \"桌面风扇开启\"")
-    p.add_argument("-n", "--note", default="", help="备注")
+    p.add_argument("event", nargs="+", help="事件名，中间有空格也不用加引号")
+    p.add_argument("-n", "--note", default="", help="可选备注")
     p.set_defaults(func=cmd_mark)
 
     p = sub.add_parser("report", help="重新生成 HTML 报告")

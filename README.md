@@ -48,9 +48,9 @@ mtl doctor --thermal  # 实跑一次 powermetrics，验证 Thermal 解析（会�
 
 ```bash
 mtl start 游戏测试          # 开始采集（默认 2s 一次）
-mtl mark "游戏启动"          # 打一个事件标记
-mtl mark "外接电源断开"
-mtl mark "桌面风扇开启"
+mtl mark 游戏启动            # 打一个事件标记（不用加引号）
+mtl mark 外接电源断开
+mtl mark 桌面风扇 开到最大    # 中间有空格也行，会拼成一句
 mtl status                  # 看实时状态
 mtl stop                    # 结束，生成报告，返回路径
 ```
@@ -77,7 +77,7 @@ mtl report --open           # 重新生成最近一次实验的报告并打开
 | `mtl start [名称] [--game [进程]]` | 开始新实验。名称留空则用时间戳 |
 | `mtl stop [会话] [--force]` | 停止采集、整理数据、生成报告 |
 | `mtl status [会话]` | 采集状态、时长、样本数、子进程、已落盘大小 |
-| `mtl mark "事件" -n 备注` | 在当前实验时间轴加事件 |
+| `mtl mark 事件 [-n 备注]` | 在当前实验时间轴加事件（空格不必加引号） |
 | `mtl report [会话] [--open]` | 重新生成 HTML 报告 |
 | `mtl recover-fps [会话] [--process 名] [--force]` | 从系统日志历史补回帧率（过滤词写错时救场） |
 | `mtl list` | 列出历史实验 |
