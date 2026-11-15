@@ -103,6 +103,19 @@ def _gb(value: Any) -> float | None:
     return None if val is None else val / (1024**3)
 
 
+def _first_num(*values: Any) -> float | None:
+    """取第一个真正有值的数字。
+
+    不能用 ``a or b``：核心真的空闲时 ``active_ratio`` 就是 0.0，
+    而 0.0 是假值，会被误当成「没有这个字段」而去拿次选值。
+    """
+    for value in values:
+        num = _num(value)
+        if num is not None:
+            return num
+    return None
+
+
 @dataclass(slots=True)
 class MacmonSample:
     ts: datetime
@@ -118,6 +131,53 @@ class MacmonSample:
         return soc if isinstance(soc, dict) else {}
 
 
+SLIM_DROP_KEYS = ("cpu_tiers", "ecpu_cores", "pcpu_cores")
+"""瘦身时丢掉的字段。
+
+这三项是每行都要重发一遍的硬件描述与逐核明细：
+`cpu_tiers`/`*_cores` 里的频率表和核编号在整场实验里是不变的，
+而报告用的都是顶层汇总标量（`ecpu_freq_mhz` 之类 macmon 本来就会给）。
+丢掉它们不改任何取值路径，也不四舍五入任何数值。
+"""
+
+SOC_CONSTANT_KEYS = ("cpu_tiers", "ecpu_freqs", "pcpu_freqs", "gpu_freqs")
+"""`soc` 里的硬件常量：频率阶梯表。核数与芯片型号保留，这两样读报告要用。"""
+
+
+def slim_record(record: dict[str, Any]) -> dict[str, Any]:
+    """去掉逐行重复的硬件描述，保留全部实测数值。
+
+    唯一有条件的处理是 `cpu_tiers`：万一某个版本的 macmon 只给分档表、
+    不给顶层标量，那就保留它，宁可大一点也不能把数据删掉。
+    """
+    needed = ("ecpu_freq_mhz", "pcpu_freq_mhz", "ecpu_active_ratio", "pcpu_active_ratio")
+    drop = set(SLIM_DROP_KEYS)
+    if any(record.get(key) is None for key in needed):
+        drop.discard("cpu_tiers")
+
+    out = {key: value for key, value in record.items() if key not in drop}
+    soc = out.get("soc")
+    if isinstance(soc, dict):
+        # 芯片型号、核数、内存要留着（报告标题会写）；
+        # `cpu_tiers` 与那几个 `*_freqs` 阶梯是整场不变的硬件常量，每行重发一遍纯属浪费
+        out["soc"] = {k: v for k, v in soc.items() if k not in SOC_CONSTANT_KEYS}
+    return out
+
+
+def load_line(line: str) -> dict[str, Any] | None:
+    """解析一行 JSONL，坏行返回 None（不抛异常，原始文件不动）。"""
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def dump_line(record: dict[str, Any]) -> str:
+    """紧凑写回一行：去掉分隔符空格，体积能再省几个百分点。"""
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
 def parse_sample(payload: dict[str, Any]) -> MacmonSample | None:
     """把一行 macmon JSON 转成规范样本。时间戳不可用的行直接丢弃（调用方需计数）。"""
     ts = parse_timestamp(_dig(payload, "timestamp"))
@@ -126,10 +186,10 @@ def parse_sample(payload: dict[str, Any]) -> MacmonSample | None:
 
     # S 核：macmon 用 pcpu_*，旧版本/文档里叫 scpu_*；优先按 cpu_tiers 标签取
     ecpu_freq = _num(_dig(payload, "ecpu_freq_mhz"))
-    pcpu_freq = _num(_dig(payload, "pcpu_freq_mhz")) or _num(_dig(payload, "scpu_freq_mhz"))
+    pcpu_freq = _first_num(_dig(payload, "pcpu_freq_mhz"), _dig(payload, "scpu_freq_mhz"))
     ecpu_active = _num(_dig(payload, "ecpu_active_ratio"))
-    pcpu_active = _num(_dig(payload, "pcpu_active_ratio")) or _num(
-        _dig(payload, "scpu_active_ratio")
+    pcpu_active = _first_num(
+        _dig(payload, "pcpu_active_ratio"), _dig(payload, "scpu_active_ratio")
     )
 
     tiers = payload.get("cpu_tiers")

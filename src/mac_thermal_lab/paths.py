@@ -156,6 +156,15 @@ class AppPaths:
     def sessions_state_dir(self) -> Path:
         return self.state_dir / SESSIONS_SUBDIR
 
+    @property
+    def raw_archive_dir(self) -> Path:
+        """`mtl clean` 把原始日志挪到这里。
+
+        放在缓存目录是有意的：系统可以回收，用户也能直接 `mtl clean --purge`
+        或手动删掉，数据目录里只留能重建报告的精简版本。
+        """
+        return self.cache_dir / "raw"
+
     def describe(self) -> list[tuple[str, Path]]:
         return [
             ("配置", self.config_dir),

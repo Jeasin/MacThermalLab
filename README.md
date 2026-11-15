@@ -80,7 +80,8 @@ mtl report --open           # 重新生成最近一次实验的报告并打开
 | `mtl mark 事件 [-n 备注]` | 在当前实验时间轴加事件（空格不必加引号） |
 | `mtl report [会话] [--open]` | 重新生成 HTML 报告 |
 | `mtl recover-fps [会话] [--process 名] [--force]` | 从系统日志历史补回帧率（过滤词写错时救场） |
-| `mtl list` | 列出历史实验 |
+| `mtl clean [会话...] [--dry-run] [--purge] [--restore]` | 原始日志挪去缓存，只留能重建报告的数据 |
+| `mtl list` | 列出历史实验（含 HUD 进程名） |
 | `mtl doctor [--thermal] [--game]` | 环境自检；`--thermal` 实跑 powermetrics，`--game` 实测帧率链路 |
 | `mtl paths [--init-config]` | 显示 XDG 目录布局；`--init-config` 写配置模板 |
 | `mtl migrate [--dry-run]` | 把旧目录里的实验迁到 XDG 数据目录 |
@@ -131,6 +132,7 @@ mtl paths
 ~/.local/share/mac-thermal-lab/recordings/2026-11-11_195302_游戏测试/
 ├── metadata.json              实验元数据（设备、SoC、间隔、状态、错误）
 ├── macmon.jsonl               原始输出，一行一个样本，未改动
+├── metrics.jsonl              精简版 macmon 采样（mtl clean 生成，字段一致、体积约 1/4）
 ├── powermetrics.log           原始输出，逐行未改动
 ├── powermetrics.err.log       powermetrics 的 stderr
 ├── powermetrics.samples.jsonl 采集时顺带解析的缓存（用于补缺失时间戳）
@@ -139,8 +141,27 @@ mtl paths
 ├── fps.jsonl                  帧率样本（fps / 窗口帧数 / 平均帧间隔 / 内存 MB）
 ├── events.jsonl               人工事件
 ├── merged.csv                 三路数据按时间戳对齐后的并集
-└── dashboard.html             离线可交互报告
+└── dashboard.html             离线可交互报告（自包含：plotly 与数据都内嵌）
 ```
+
+### 体积与归档
+
+两小时的游戏实测能到 120 MB，大头是原始日志：`macmon.jsonl` 每行都重发一份
+SoC 频率表和逐核数组，`hud.log` 每行还带 `backtrace` 之类的日志元数据。
+
+```bash
+mtl clean                    # 精简 macmon → 刷新报告 → 原始日志挪去缓存
+mtl clean --dry-run          # 只看能省多少
+mtl clean --purge            # 删掉缓存里的原始归档
+mtl clean --restore          # 把原始日志搬回会话目录
+```
+
+归档落在 `~/.cache/mac-thermal-lab/raw/<会话>/`（缓存目录，系统可回收）。
+会话目录只留 `dashboard.html` + 精简数据，`mtl report` 仍能重建报告，
+因为 `metrics.jsonl` 与 `macmon.jsonl` 字段完全一致、数值逐位相同。
+
+`dashboard.html` 是自包含的：plotly 与所有曲线数据都内嵌在这一个文件里，
+没有外部引用。只想留报告的话，`mtl clean --purge` 之后把这个 html 单独拷走也能看。
 
 `state.json` / `collector.log` / 锁文件不在实验目录里，分别在 STATE 与 RUNTIME 下，
 所以把整个 recordings 目录拷走或挂到网盘，不会带上运行期垃圾。

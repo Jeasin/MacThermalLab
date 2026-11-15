@@ -103,7 +103,12 @@ class SessionData:
 def _load_macmon(paths: SessionPaths, warnings: list[str]) -> list[MacmonSample]:
     samples: list[MacmonSample] = []
     bad = 0
-    for record in iter_jsonl(paths.macmon_raw):
+    source = paths.macmon_raw
+    if not source.exists() and paths.metrics_clean.exists():
+        # 原始文件被 mtl clean 归档到缓存了；精简版字段一致，能照样重建
+        source = paths.metrics_clean
+        warnings.append("原始 macmon.jsonl 已归档，本次使用精简的 metrics.jsonl")
+    for record in iter_jsonl(source):
         sample = macmon_mod.parse_sample(record)
         if sample is None:
             bad += 1
@@ -111,7 +116,7 @@ def _load_macmon(paths: SessionPaths, warnings: list[str]) -> list[MacmonSample]
         samples.append(sample)
     samples.sort(key=lambda s: s.ts)
     if bad:
-        warnings.append(f"macmon.jsonl 中有 {bad} 行无法解析时间戳，已跳过（原始文件保留）")
+        warnings.append(f"{source.name} 中有 {bad} 行无法解析时间戳，已跳过（原始文件保留）")
     return samples
 
 
@@ -135,7 +140,7 @@ def _load_thermal(paths: SessionPaths, warnings: list[str]) -> list[ThermalSampl
         if missing:
             warnings.append(f"有 {missing} 条 thermal 样本取不到时间戳，未进入时间轴（原始记录保留）")
     elif sidecar:
-        warnings.append("原始 powermetrics 日志缺失，已回退到采集缓存")
+        warnings.append("原始 powermetrics 日志不在会话目录（已归档或缺失），改用采集缓存")
         samples = sidecar
 
     located = [s for s in samples if s.ts is not None]

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import clean as clean_mod
 from . import fps as fps_mod
 from .analysis import load_session, summary as build_summary
 from .collector import run_collector
@@ -602,6 +603,11 @@ def cmd_stop(args) -> int:
         print()
         for message in smy["warnings"]:
             print(warn(message))
+    size = clean_mod.dir_size(session.root)
+    if size > 40 * 1024 * 1024:
+        print()
+        print(c(f"本次数据 {clean_mod.human_size(size)}；"
+                f"mtl clean 可把原始日志挪去缓存，报告照样能重建", C_DIM))
     if args.open:
         subprocess.run(["open", str(dashboard)], check=False)
     return 0
@@ -1078,6 +1084,110 @@ def _fmt_num(value: Any, digits: int) -> str:
     return "-" if value is None else f"{float(value):.{digits}f}"
 
 
+def _clean_targets(paths: AppPaths, names: list[str]) -> list[SessionPaths]:
+    roots = _records_roots(paths)
+    if names:
+        return [resolve_session_multi(roots, token) for token in names]
+    return list_sessions_multi(roots)
+
+
+def cmd_clean(args) -> int:
+    """把原始日志挪去缓存，只留能重建报告的数据。"""
+    paths = _app_paths(args)
+    try:
+        targets = _clean_targets(paths, args.sessions)
+    except LookupError as exc:
+        print(err(str(exc)))
+        return 1
+    if not targets:
+        print(f"{paths.recordings_dir} 下还没有实验记录")
+        return 0
+
+    if args.purge:
+        return _purge_archives(paths, targets)
+    if args.restore:
+        return _restore_archives(paths, targets)
+    return _slim_sessions(paths, targets, dry_run=args.dry_run)
+
+
+def _slim_sessions(paths: AppPaths, targets: list[SessionPaths], dry_run: bool) -> int:
+    print(heading("整理实验数据"))
+    print(c(f"原始日志 → {paths.raw_archive_dir}", C_DIM))
+    print(c("会话目录保留：dashboard.html / metrics / fps / thermal 样本 / events", C_DIM))
+    print()
+
+    rows: list[list[str]] = []
+    total_before = total_after = 0
+    for session in targets:
+        result = clean_mod.clean_session(session, paths, dry_run=dry_run)
+        if result.skipped:
+            rows.append([session.name, "-", "-", c(result.skipped, C_DIM)])
+            continue
+        total_before += result.before_bytes
+        total_after += result.after_bytes
+        note = "报告已刷新" if result.report_written else ""
+        rows.append([
+            session.name,
+            clean_mod.human_size(result.before_bytes),
+            clean_mod.human_size(result.after_bytes),
+            note,
+        ])
+
+    print(_table(["会话", "整理前", "整理后", "说明"], rows))
+    if total_before:
+        print()
+        print(ok(f"合计 {clean_mod.human_size(total_before)} → "
+                 f"{clean_mod.human_size(total_after)}，"
+                 f"省 {clean_mod.human_size(max(0, total_before - total_after))}"))
+    if dry_run:
+        print(c("--dry-run：只估算，没有动任何文件", C_DIM))
+        return 0
+
+    count, size = clean_mod.archive_summary(paths)
+    if count:
+        print(f"  缓存归档 {count} 个文件、{clean_mod.human_size(size)}："
+              f"{paths.raw_archive_dir}")
+        print(c("  报告和数据都能从会话目录重建；确认不需要留档后：", C_DIM))
+        print(f"  {c('mtl clean --purge', C_BOLD)} 删除归档　"
+              f"{c('mtl clean --restore', C_BOLD)} 取回原始日志")
+    return 0
+
+
+def _purge_archives(paths: AppPaths, targets: list[SessionPaths]) -> int:
+    total = size_total = 0
+    for session in targets:
+        count, size = clean_mod.purge_archive(session, paths)
+        total += count
+        size_total += size
+        if count:
+            print(f"  {session.name}  删除 {count} 个文件，{clean_mod.human_size(size)}")
+    if not total:
+        print(warn("缓存里没有可删除的原始归档"))
+        return 0
+    print()
+    print(ok(f"已删除 {total} 个归档文件，释放 {clean_mod.human_size(size_total)}"))
+    print(c("  会话目录里的 dashboard.html / metrics.jsonl / fps.jsonl 不受影响", C_DIM))
+    return 0
+
+
+def _restore_archives(paths: AppPaths, targets: list[SessionPaths]) -> int:
+    total = 0
+    for session in targets:
+        restored = clean_mod.restore_raw(session, paths)
+        if not restored:
+            continue
+        total += len(restored)
+        names = "、".join(path.name for path in restored)
+        print(f"  {session.name}  {names}")
+    if not total:
+        print(warn("缓存里没有可恢复的归档"))
+        return 0
+    print()
+    print(ok(f"已取回 {total} 个原始文件"))
+    print(c("  已有同名文件的不会被覆盖；恢复后建议 mtl report 重出报告", C_DIM))
+    return 0
+
+
 def cmd_migrate(args) -> int:
     paths = _app_paths(args)
     source = Path(args.source).expanduser() if args.source else legacy_recordings()
@@ -1154,6 +1264,7 @@ def build_parser() -> argparse.ArgumentParser:
 数据位置:
   mtl paths                查看配置/数据/状态目录（XDG）
   mtl migrate              把旧目录里的实验迁到新位置
+  mtl clean                原始日志挪去缓存，只留能重建报告的数据
 """,
     )
     parser.add_argument("--version", action="version", version=f"mtl {__version__}")
@@ -1202,6 +1313,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--process", help="HUD 进程名；默认用 metadata 里记录的")
     p.add_argument("--force", action="store_true", help="已有帧率样本时也覆盖")
     p.set_defaults(func=cmd_recover_fps)
+
+    p = sub.add_parser("clean", help="瘦身：原始日志挪去缓存，只留能重建报告的数据")
+    p.add_argument("sessions", nargs="*", help="实验目录名（默认所有实验）")
+    p.add_argument("--dry-run", action="store_true", help="只估算体积，不动文件")
+    p.add_argument("--purge", action="store_true", help="删除缓存里的原始归档")
+    p.add_argument("--restore", action="store_true", help="把归档的原始日志搬回会话目录")
+    p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("list", help="列出历史实验")
     p.set_defaults(func=cmd_list)

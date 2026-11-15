@@ -35,6 +35,7 @@ DAEMON_LOG = "collector.log"
 HUD_RAW = "hud.log"
 HUD_ERR = "hud.err.log"
 FPS_SAMPLES = "fps.jsonl"
+METRICS_CLEAN = "metrics.jsonl"
 
 # 会话目录里属于「实验数据」的文件（会随迁移一起搬走）
 DATA_FILES = (
@@ -49,6 +50,16 @@ DATA_FILES = (
     HUD_RAW,
     HUD_ERR,
     FPS_SAMPLES,
+    METRICS_CLEAN,
+)
+
+# 瘦身时挪去缓存归档的原始文件（体积大头，且都能从精简数据重建）
+RAW_ARCHIVE_FILES = (
+    MACMON_RAW,
+    HUD_RAW,
+    HUD_ERR,
+    POWERMETRICS_RAW,
+    POWERMETRICS_ERR,
 )
 
 # 旧布局里混在会话目录中的运行期文件，迁移时挪去 state/runtime
@@ -254,6 +265,15 @@ class SessionPaths:
     @property
     def fps_samples(self) -> Path:
         return self.root / FPS_SAMPLES
+
+    @property
+    def metrics_clean(self) -> Path:
+        """精简后的 macmon 采样：同一套字段，去掉每行重复的 SoC 频率表与逐核数组。"""
+        return self.root / METRICS_CLEAN
+
+    def raw_archive_targets(self) -> list[Path]:
+        """当前仍留在会话目录里的原始文件。"""
+        return [self.root / name for name in RAW_ARCHIVE_FILES if (self.root / name).exists()]
 
     @property
     def legacy_runtime_files(self) -> list[Path]:
